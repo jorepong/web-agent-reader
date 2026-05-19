@@ -119,6 +119,17 @@ export class DebugLogger {
         process.stderr.write(`${tag} 보고: ${status} — ${String(report["summary"]).slice(0, 100)}\n`);
         break;
       }
+      case "recursion_decision": {
+        const depth = p["depth"] as number;
+        const shouldExplore = p["shouldExploreDeeper"] as boolean;
+        const linkIds = (p["suggestedLinkIds"] as string[]) ?? [];
+        if (shouldExplore) {
+          process.stderr.write(`${tag} [depth=${depth}] 재귀 탐색 결정 → ${linkIds.join(", ")}\n`);
+        } else {
+          process.stderr.write(`${tag} [depth=${depth}] 재귀 탐색 불필요\n`);
+        }
+        break;
+      }
       case "final_answer":
         process.stderr.write(`${tag} 최종 답변 합성 중...\n`);
         break;

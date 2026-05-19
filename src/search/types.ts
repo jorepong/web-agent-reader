@@ -11,6 +11,7 @@ export interface MissionBrief {
   goal: string;
   url: string;
   parentGoal: string;
+  depth: number;
 }
 
 export interface ExplorationReport {
@@ -20,6 +21,7 @@ export interface ExplorationReport {
   summary: string;
   relevantExcerpts: string[];
   tokenUsage: TokenUsage;
+  childReports?: ExplorationReport[];
 }
 
 export interface TokenUsage {
@@ -40,4 +42,5 @@ export type LogEventKind =
   | "llm_response"
   | "page_markdown"
   | "orchestrator_plan"
-  | "final_answer";
+  | "final_answer"
+  | "recursion_decision";

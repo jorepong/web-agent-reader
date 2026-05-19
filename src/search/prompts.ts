@@ -1,5 +1,7 @@
 import type { ExplorationReport, LLMMessage, MissionBrief } from "./types.js";
 
+export const MAX_DEPTH = 2;
+
 export function buildSearchQueryPrompt(userQuery: string): LLMMessage[] {
   return [
     {
@@ -66,10 +68,32 @@ ${findingsSummary}`,
 }
 
 export function buildExplorerPrompt(brief: MissionBrief, pageMarkdown: string): LLMMessage[] {
-  return [
-    {
-      role: "system",
-      content: `You are a focused research assistant. You receive a web page in Markdown and a specific goal.
+  const canGoDeeper = brief.depth < MAX_DEPTH;
+
+  const systemContent = canGoDeeper
+    ? `You are a focused research assistant. You receive a web page in Markdown and a specific goal.
+Extract only information relevant to the goal. Do not summarize the whole page.
+
+Link IDs in the page look like [L1], [L2], etc. After extracting relevant information, decide if you need to explore a linked page for more detail.
+
+Respond with JSON only (no markdown code fences):
+{
+  "found": true,
+  "summary": "2-5 sentence digest of what was found relevant to the goal",
+  "relevantExcerpts": ["up to 3 short verbatim quotes from the page that support the summary — omit link IDs like [L1] and markdown headings like ## Heading"],
+  "shouldExploreDeeper": false,
+  "suggestedLinkIds": []
+}
+
+Rules for shouldExploreDeeper and suggestedLinkIds:
+- Set shouldExploreDeeper=true ONLY if a linked page clearly contains more specific, relevant information not present here
+- Suggest at most 3 link IDs (e.g. ["L3", "L7"]) — pick the most promising ones
+- If you already found sufficient information, or no relevant links exist: shouldExploreDeeper=false, suggestedLinkIds=[]
+- Always omit link IDs from relevantExcerpts
+
+If nothing relevant is found:
+{"found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "shouldExploreDeeper": false, "suggestedLinkIds": []}`
+    : `You are a focused research assistant. You receive a web page in Markdown and a specific goal.
 Extract only information relevant to the goal. Do not summarize the whole page.
 
 Respond with JSON only (no markdown code fences):
@@ -80,8 +104,10 @@ Respond with JSON only (no markdown code fences):
 }
 
 If nothing relevant is found:
-{"found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`,
-    },
+{"found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`;
+
+  return [
+    { role: "system", content: systemContent },
     {
       role: "user",
       content: `Goal: ${brief.goal}\nOriginal user question: ${brief.parentGoal}\n\nPage content:\n${pageMarkdown}`,
