@@ -31,11 +31,12 @@ llm-page-reader 위에 구축된 계층적 에이전트 기반 웹 검색 도구
 ```
 src/search/
   types.ts          — 공유 타입 (SearchOptions, MissionBrief, ExplorationReport 등)
-  logger.ts         — 디버그 로거 (JSON 트리 구조, finalize()로 일괄 저장)
-  openai-client.ts  — OpenAI SDK 래퍼 (자동 로깅 내장)
-  prompts.ts        — 모든 LLM 프롬프트 템플릿
+  logger.ts         — 디버그 로거 (시간순 들여쓰기 JSONL, finalize()로 일괄 저장)
+  openai-client.ts  — OpenAI SDK 래퍼 (자동 로깅 + JSON 응답 강제 옵션)
+  prompts.ts        — 모든 LLM 프롬프트 템플릿 + 하드 리밋 상수
   explorer.ts       — 탐색 에이전트 (runExplorationAgent)
   orchestrator.ts   — 오케스트레이터 (runSearch)
+  json-utils.ts     — LLM 응답에서 JSON을 관대하게 파싱 (parseJsonResponse)
   cli.ts            — llm-search CLI 진입점
 ```
 
@@ -63,7 +64,10 @@ ConvertResult = { page: PageAst, markdown: string, links: LinkRegistry, elements
 
 // 에이전트 간 통신
 MissionBrief    — 상위 → 하위 에이전트 지시 (agentId, parentAgentId, goal, url, parentGoal, depth)
-ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary, relevantExcerpts, tokenUsage)
+ExplorationReport — 하위 → 상위 에이전트 보고
+  (url, found, completeness, summary, relevantExcerpts, missingInfo, tokenUsage)
+  completeness: "complete" | "partial" | "none" — 부분 정보임을 명시적으로 표현
+  missingInfo:  string[] — 답을 위해 더 필요했던 정보의 항목들
 ```
 
 ---
@@ -98,12 +102,18 @@ ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary
 5. [LLM] 수집된 보고로 최종 답변 합성
 
 **탐색 에이전트 아젠틱 루프** (`runExplorationAgent` 내부):
-- 페이지 변환 후 초기 messages 구성
+- 페이지 변환 후 초기 messages 구성. 페이지는 "출발점"으로 프레이밍되어, 자식 탐색이 일상적 선택지임을 명시.
 - 루프 (최대 MAX_CHILD_CALLS_PER_AGENT=3회):
   - [LLM] 판단: `explore(linkId)` or `done(summary)`
   - explore → 자식 에이전트 실행, 보고 수신, messages에 append (재구성 금지)
   - done → ExplorationReport 반환 (자식 결과를 선별 통합한 summary 포함)
 - depth >= MAX_DEPTH(2) 시 explore 판단 무시, "탐색 불가" 메시지 주입 후 done 유도
+
+**done 결정 게이트** (이번 라운드에서 done을 고르려면 BOTH 만족):
+1. 현재 페이지의 잔여 링크 중 "더 권위/검증 가치가 있을 만한" 것이 없을 때
+2. 목표가 명시적으로 요구하는 검증 가능한 정보를 모두 모았을 때
+
+프롬프트는 done의 비가역성도 경고한다 — done 반환 시 해당 페이지와 그로부터 도달 가능한 모든 페이지가 잠긴다(재방문 불가). list/history 형태 질문에서는 `completeness="complete"`를 보수적으로 사용하도록 명시.
 
 **SERP 기반 합성 특이 동작**: 탐색이 없거나 모든 탐색이 `found=false`이면 SERP 스니펫으로 합성.
 이 경우 `useSerpSynthesis=true`로 합성 프롬프트에 전달 → URL 인용 금지 (실제 방문 안 함).
@@ -119,27 +129,19 @@ ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary
 
 ## 디버그 로그 구조
 
-`--debug` 활성화 시 에이전트 계층을 반영한 JSON 트리 파일 생성:
+`--debug` 활성화 시 `search-<timestamp>.jsonl` 파일을 생성. 각 줄이 유효한 JSON 한 개이며, 에이전트 깊이만큼 좌측 공백(depth × 2)으로 들여써서 계층을 시각화한다.
 
-```json
-{
-  "agentId": "orchestrator",
-  "depth": 0,
-  "events": [
-    { "kind": "llm_request", "payload": { "callId": "...", "messages": [...] } },
-    { "kind": "llm_response", "payload": { "callId": "...", "response": "...", "tokenUsage": {...} } },
-    { "kind": "orchestrator_plan", "payload": { "round": 1, "action": "explore", "url": "..." } }
-  ],
-  "children": [
-    {
-      "agentId": "explorer-1",
-      "depth": 1,
-      "events": [...],
-      "children": []
-    }
-  ]
-}
 ```
+{"timestamp":"...","agentId":"orchestrator","depth":0,"kind":"llm_request","payload":{...}}
+{"timestamp":"...","agentId":"orchestrator","depth":0,"kind":"orchestrator_plan","payload":{"round":1,"action":"explore","url":"..."}}
+  {"timestamp":"...","agentId":"explorer-1","depth":1,"kind":"mission_brief","payload":{...}}
+  {"timestamp":"...","agentId":"explorer-1","depth":1,"kind":"page_markdown","payload":{...}}
+    {"timestamp":"...","agentId":"explorer-1-l3","depth":2,"kind":"mission_brief","payload":{...}}
+  {"timestamp":"...","agentId":"explorer-1","depth":1,"kind":"exploration_report","payload":{...}}
+{"timestamp":"...","agentId":"orchestrator","depth":0,"kind":"final_answer","payload":{...}}
+```
+
+ISO 8601 타임스탬프 문자열 정렬 = 시간순 정렬을 활용해 finalize 시점에 한 번만 정렬·저장한다.
 
 기록 이벤트 종류:
 - `llm_request` / `llm_response` — LLM 호출 입출력 + 토큰 사용량
@@ -157,8 +159,8 @@ ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary
 ## 코딩 컨벤션
 
 - 새 파일은 기존 패턴 그대로 따름
-- 에러 처리: 탐색 에이전트는 크래시 없이 폴백 리포트 반환 (found: false)
-- LLM 응답 JSON 파싱은 항상 try/catch로 감쌈
+- 에러 처리: 탐색 에이전트는 크래시 없이 폴백 리포트 반환 (found: false, completeness: "none")
+- LLM 응답 JSON 파싱은 `parseJsonResponse`(`json-utils.ts`) 사용 — 코드펜스/주변 prose를 허용. JSON을 기대하는 호출은 `client.complete(..., { jsonResponse: true })`로 `response_format: json_object`를 강제.
 - 싱글톤/전역 상태 금지 — logger, client 인스턴스는 명시적으로 주입
 - 프롬프트 변경은 모두 `prompts.ts`에서만
 

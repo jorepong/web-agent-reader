@@ -86,13 +86,13 @@ OPENAI_API_KEY=sk-...
 
 ### 디버그 모드
 
-`--debug` 활성화 시 에이전트 실행 과정 전체를 JSON 파일로 저장합니다.
+`--debug` 활성화 시 에이전트 실행 과정 전체를 JSONL 파일로 저장합니다.
 
 ```bash
 node dist/search/cli.js --query "질문" --debug --log-dir ./logs
 ```
 
-터미널에는 실시간 상태가 출력되고, `logs/search-*.json`에 에이전트 계층 구조와 모든 LLM 호출 내역·토큰 사용량이 기록됩니다.
+터미널에는 실시간 상태가 출력되고, `logs/search-*.jsonl`에 모든 LLM 호출 내역과 토큰 사용량이 시간순으로 기록됩니다. 각 줄은 유효한 JSON 한 개이며, 에이전트 깊이만큼 좌측 공백으로 들여써서 호출 계층을 시각화합니다.
 
 ---
 
