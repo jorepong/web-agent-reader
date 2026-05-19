@@ -1,10 +1,16 @@
-// 디버그 로거. 에이전트 계층을 반영한 JSON 트리 파일을 생성한다.
+// 디버그 로거. 모든 에이전트 이벤트를 시간순 들여쓰기 JSONL 파일로 저장한다.
+//
+// 출력 형식: 각 줄이 유효한 JSON 객체, depth * 2 스페이스로 들여쓰기
+//   {"timestamp":"...","agentId":"orchestrator","depth":0,"kind":"llm_request",...}
+//     {"timestamp":"...","agentId":"explorer-1","depth":1,"kind":"mission_brief",...}
+//       {"timestamp":"...","agentId":"explorer-1-l3","depth":2,"kind":"page_markdown",...}
+//     {"timestamp":"...","agentId":"explorer-1","depth":1,"kind":"exploration_report",...}
+//   {"timestamp":"...","agentId":"orchestrator","depth":0,"kind":"final_answer",...}
 //
 // 설계 원칙:
 //   - 모든 이벤트를 메모리에 누적한 뒤 finalize()에서 일괄 저장.
-//     단점: 크래시 시 로그 유실. 장점: 에이전트 트리를 정확히 구성할 수 있음.
+//     단점: 크래시 시 로그 유실. 장점: 타임스탬프 기반 정렬이 finalize 시점에 가능.
 //   - 에이전트 깊이(depth)는 startAgent() 호출 시 parentAgentId를 기반으로 자동 계산.
-//     MissionBrief의 depth와는 별개 — 로거가 독립적으로 트리를 추적.
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { LogEventKind } from "./types.js";
@@ -26,13 +32,12 @@ interface AgentNode {
 export class DebugLogger {
   private filePath: string;
   private enabled: boolean;
-  // Map 순서 = 에이전트 등록 순서 → buildTree()에서 children 정렬 시 활용
   private agents: Map<string, AgentNode> = new Map();
 
   constructor(enabled: boolean, logDir = ".") {
     this.enabled = enabled;
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    this.filePath = path.join(logDir, `search-${timestamp}.json`);
+    this.filePath = path.join(logDir, `search-${timestamp}.jsonl`);
   }
 
   async init(): Promise<void> {
@@ -70,28 +75,37 @@ export class DebugLogger {
   async finalize(): Promise<void> {
     if (!this.enabled || this.agents.size === 0) return;
     try {
-      await writeFile(this.filePath, JSON.stringify(this.buildTree(), null, 2));
+      const lines = this.buildFlatLog();
+      await writeFile(this.filePath, lines.join("\n") + "\n");
     } catch (err) {
-      process.stderr.write(`[logger] JSON 파일 저장 실패: ${err}\n`);
+      process.stderr.write(`[logger] JSONL 파일 저장 실패: ${err}\n`);
     }
   }
 
-  // 에이전트 Map을 순회해 parentAgentId 기반으로 트리를 재귀 구성한다.
-  // 루트가 정확히 하나면 객체로, 여러 개면 배열로 반환 (정상 상황은 항상 단일 루트).
-  private buildTree(): unknown {
-    const buildNode = (node: AgentNode): unknown => ({
-      agentId: node.agentId,
-      depth: node.depth,
-      startedAt: node.startedAt,
-      events: node.events,
-      children: [...this.agents.values()]
-        .filter((a) => a.parentAgentId === node.agentId)
-        .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-        .map(buildNode),
-    });
+  // 모든 에이전트의 이벤트를 모아 타임스탬프 순으로 정렬한 뒤,
+  // 각 이벤트를 depth * 2 스페이스로 들여쓴 JSON 줄로 변환한다.
+  // ISO 8601 타임스탬프는 문자열 사전순 정렬이 시간순 정렬과 동일하다.
+  private buildFlatLog(): string[] {
+    const entries: { timestamp: string; agentId: string; depth: number; kind: LogEventKind; payload: unknown }[] = [];
 
-    const roots = [...this.agents.values()].filter((a) => a.parentAgentId === null);
-    return roots.length === 1 ? buildNode(roots[0]) : roots.map(buildNode);
+    for (const agent of this.agents.values()) {
+      for (const event of agent.events) {
+        entries.push({
+          timestamp: event.timestamp,
+          agentId: agent.agentId,
+          depth: agent.depth,
+          kind: event.kind,
+          payload: event.payload,
+        });
+      }
+    }
+
+    entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    return entries.map(({ timestamp, agentId, depth, kind, payload }) => {
+      const indent = " ".repeat(depth * 2);
+      return indent + JSON.stringify({ timestamp, agentId, depth, kind, payload });
+    });
   }
 
   // 터미널 실시간 출력 — stderr에 기록해 stdout(최종 답변)과 분리.
