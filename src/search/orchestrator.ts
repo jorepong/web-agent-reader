@@ -2,6 +2,7 @@
 // 흐름: 검색 쿼리 생성 → SERP 변환 → 아젠틱 탐색 루프 → 최종 합성
 import { convertPage } from "../index.js";
 import { runExplorationAgent } from "./explorer.js";
+import { parseJsonResponse } from "./json-utils.js";
 import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
 import { buildNextActionPrompt, buildSearchQueryPrompt, buildSynthesisPrompt } from "./prompts.js";
@@ -64,13 +65,19 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   for (let round = 1; round <= MAX_PAGES; round++) {
     const { text: actionJson } = await client.complete(
       "orchestrator",
-      buildNextActionPrompt(options.query, serpSnippets, reports, exploredUrls, MAX_PAGES)
+      buildNextActionPrompt(options.query, serpSnippets, reports, exploredUrls, MAX_PAGES),
+      { jsonResponse: true }
     );
 
-    let action: { action: "explore" | "done"; linkId?: string; rationale?: string; reason?: string };
-    try {
-      action = JSON.parse(actionJson);
-    } catch {
+    // 관대한 JSON 파서: 코드펜스/주변 prose가 섞여도 첫 번째 JSON 블록을 추출.
+    const action = parseJsonResponse<{
+      action: "explore" | "done";
+      linkId?: string;
+      task?: string;
+      rationale?: string;
+      reason?: string;
+    }>(actionJson);
+    if (!action) {
       // JSON 파싱 실패 = LLM 응답 오류, 더 이상 탐색 불가
       break;
     }
@@ -92,6 +99,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       action: "explore",
       linkId: action.linkId,
       url: entry.url,
+      task: action.task,
       rationale: action.rationale,
     });
 
@@ -100,7 +108,8 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
     const brief: MissionBrief = {
       agentId: `explorer-${round}`,
       parentAgentId: "orchestrator",
-      goal: action.rationale ?? options.query,
+      // task: 하위 에이전트에게 전달할 명확한 작업 지시 (rationale은 로그용)
+      goal: action.task ?? options.query,
       url: entry.url,
       parentGoal: options.query,
       depth: 0, // 오케스트레이터가 생성하는 탐색 에이전트는 항상 depth 0에서 시작
@@ -125,9 +134,11 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         agentId: "orchestrator",
         url: googleUrl,
         found: true,
+        completeness: "partial",
         // 합성용이므로 링크 ID 제거 — 방문하지 않은 URL 인용 방지
         summary: extractSerpSnippets(serpResult.markdown, false),
         relevantExcerpts: [],
+        missingInfo: ["Only Google result snippets were available; pages were not verified."],
         tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       }]
     : usefulReports;

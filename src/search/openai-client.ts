@@ -17,7 +17,13 @@ export class OpenAIClient {
     this.logger = logger;
   }
 
-  async complete(agentId: string, messages: LLMMessage[]): Promise<{ text: string; tokenUsage: TokenUsage }> {
+  // jsonResponse=true: 모델에 JSON 객체 응답을 강제. 호출부의 프롬프트에 "JSON"이 포함돼 있어야 함.
+  // 기본 false — 검색 쿼리 생성처럼 plain text를 반환하는 호출과 호환 유지.
+  async complete(
+    agentId: string,
+    messages: LLMMessage[],
+    options: { jsonResponse?: boolean } = {}
+  ): Promise<{ text: string; tokenUsage: TokenUsage }> {
     // callId: 같은 에이전트가 여러 번 LLM을 호출할 때 로그에서 요청-응답 쌍을 구분하기 위한 식별자
     const callId = crypto.randomUUID();
 
@@ -26,7 +32,9 @@ export class OpenAIClient {
     const response = await this.client.chat.completions.create({
       model: this.model,
       messages,
-      temperature: 0, // 에이전트 판단의 일관성·재현성 확보
+      // 일부 최신 추론 모델은 temperature를 기본값(1)으로만 허용하므로 명시 전달하지 않음
+      reasoning_effort: "high",
+      ...(options.jsonResponse ? { response_format: { type: "json_object" as const } } : {}),
     });
 
     const text = response.choices[0]?.message?.content;

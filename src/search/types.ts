@@ -22,14 +22,18 @@ export interface MissionBrief {
   depth: number;
 }
 
+export type ReportCompleteness = "complete" | "partial" | "none";
+
 // 탐색 에이전트가 상위 에이전트에게 반환하는 보고서.
 // summary: 에이전트가 자식 탐색 결과를 선별·통합한 최종 요약 (아젠틱 루프 내에서 합성됨).
 export interface ExplorationReport {
   agentId: string;
   url: string;
   found: boolean;
+  completeness: ReportCompleteness;
   summary: string;
   relevantExcerpts: string[];
+  missingInfo: string[];
   tokenUsage: TokenUsage;
 }
 

@@ -44,7 +44,10 @@ export function buildNextActionPrompt(
     reports.length === 0
       ? "None yet."
       : reports
-          .map((r, i) => `[${i + 1}] ${r.url}\n  found=${r.found} — ${r.summary}`)
+          .map((r, i) => {
+            const missing = r.missingInfo.length > 0 ? `\n  missing=${r.missingInfo.join("; ")}` : "";
+            return `[${i + 1}] ${r.url}\n  found=${r.found}, completeness=${r.completeness} — ${r.summary}${missing}`;
+          })
           .join("\n\n");
 
   const exploredList = exploredUrls.length === 0 ? "None." : exploredUrls.map((u) => `- ${u}`).join("\n");
@@ -54,20 +57,29 @@ export function buildNextActionPrompt(
       role: "system",
       content: `You are a research agent deciding how to proceed with a web search.
 
+Output format requirement (read first): respond with a single JSON object only. No prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes shown below and nothing else.
+
 You have access to a Google search results page. Based on findings so far, decide:
 1. Explore another page — if current findings are insufficient to answer the question
 2. Stop — if you already have enough information to give a complete, reliable answer
 
 Rules:
 - Only explore if it would meaningfully improve the answer
-- Stop if you have sufficient, reliable information — do not explore just to be thorough
 - Never re-explore an already-visited URL
 - You have explored ${exploredUrls.length} of max ${maxPages} pages
+- If findings contain information that seems inferred or imprecise (e.g., dates estimated from context), consider exploring a more authoritative source
+- Even if current findings appear to answer the question, inspect the remaining SERP candidates before choosing done.
+- If an unexplored SERP result is likely to be clearer, more structured, more authoritative, or better for verification, choose Explore instead of Stop.
+- Stop only when you have strong confidence in the answer, or when no relevant unvisited SERP candidate is likely to improve completeness or reliability.
+- Do not explore just to be broad; explore only when the page is likely to improve completeness, precision, authority, or verification.
 
 Respond with JSON only (no markdown code fences):
-Explore: {"action": "explore", "linkId": "L5", "rationale": "Why this page is worth exploring next"}
+Explore: {"action": "explore", "linkId": "L5", "task": "Concise instruction for the sub-agent (what to find)", "rationale": "Why this page is worth exploring"}
 Stop:    {"action": "done", "reason": "Why current findings are sufficient"}
 
+Rules for task vs rationale:
+- task: short imperative instruction stating WHAT the sub-agent should find, treating the chosen URL as ITS starting point (the sub-agent may follow further links from there). E.g. "Faker 페이지를 기점으로 함께한 역대 탑라이너 목록 추출"
+- rationale: brief justification for WHY this URL was selected (for logging only)
 The linkId MUST be one of the IDs (e.g. [L5]) visible in the search results above. Do not invent IDs.`,
     },
     {
@@ -91,36 +103,67 @@ ${findingsSummary}`,
 // depth >= MAX_DEPTH: 더 이상 자식 호출 불가 → done만 허용하는 별도 시스템 메시지 사용.
 export function buildExplorerInitialPrompt(brief: MissionBrief, pageMarkdown: string): LLMMessage[] {
   const canExplore = brief.depth < MAX_DEPTH;
+  // canExplore 분기에서는 본문(systemContent)의 done 게이트가 이 역할을 직접 수행한다.
+  // 여기서는 자식 호출이 불가능한 경우(depth >= MAX_DEPTH)의 부가 룰만 남긴다.
+  const linkDecisionRules = canExplore
+    ? ""
+    : `- You cannot explore further links.
+- If a linked page looks relevant but could not be visited, mention the missing verification need in missingInfo.
+- Do not claim information from unvisited linked pages.`;
+
+  // 할루시네이션 방지 규칙 — 모든 에이전트 깊이에 공통 적용.
+  // 페이지에 없는 정보를 학습 데이터로 채우는 것을 명시적으로 금지.
+  const groundingRules = `
+Critical rules for summary and excerpts:
+- Base your summary ONLY on information explicitly stated in this page. Do not supplement with prior knowledge.
+- If the page lacks certain details (e.g., exact dates, roles, complete lists), do not infer or assume them — say the page does not contain that information.
+- relevantExcerpts must be verbatim quotes from the page. Do not paraphrase or reconstruct.
+- If the question asks for historical/all/complete/list-style coverage and this page only contains examples or partial data, mark the report as partial.
+${linkDecisionRules}`;
 
   const systemContent = canExplore
     ? `You are a focused research agent with a specific goal.
-Analyze the given web page and find information relevant to the goal.
 
-After analysis, decide your next action:
-1. Explore — if a specific linked page clearly contains more relevant information not present here
-2. Done — if you have sufficient information, or no valuable links exist
+Output format requirement (read first): respond with a single JSON object only. No prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes shown below and nothing else.
 
-Link IDs look like [L1], [L2], etc. You can explore at most ${MAX_CHILD_CALLS_PER_AGENT} links total.
+The given web page is your starting point. Your goal may be answerable from this page alone, or it may require following links on this page to other pages — you can dispatch a sub-agent to any linked page, and that sub-agent can in turn dispatch its own sub-agents. Treat link-following as a normal part of the mission, not a last resort.
+
+At each step, choose exactly one of these two options (they are equal choices — neither is the default):
+- Explore: dispatch a sub-agent to a linked page on this page (you can do this up to ${MAX_CHILD_CALLS_PER_AGENT} times total during this mission)
+- Done: stop and return your final report
+
+Choose \`done\` only when BOTH hold:
+(a) no remaining link on this page appears likely to contain additional, more authoritative, or more verifiable information beyond what you have already gathered, AND
+(b) you have all the verifiable information explicitly required by the goal.
+
+Important: once you return \`done\`, this page and every page reachable from it are locked — you cannot revisit, extend, or correct the report later. Decide carefully.
+${groundingRules}
+
+Link IDs look like [L1], [L2], etc.
 
 Respond with JSON only (no markdown code fences):
-Explore: {"action": "explore", "linkId": "L3", "rationale": "Why this link is worth exploring"}
-Done:    {"action": "done", "found": true, "summary": "2-5 sentence digest of relevant findings", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"]}
+Explore: {"action": "explore", "linkId": "L3", "task": "Concise instruction for the sub-agent (treating the chosen linked page as ITS starting point)", "rationale": "Why this link is worth exploring"}
+Done:    {"action": "done", "found": true, "completeness": "complete", "summary": "2-5 sentence digest of findings, based on the pages you have visited", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": []}
+Partial: {"action": "done", "found": true, "completeness": "partial", "summary": "Relevant but incomplete findings, based on the pages you have visited", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": ["what is missing"]}
 
 Rules:
-- Only explore if it would meaningfully add to your findings
 - The linkId MUST appear in the page content above. Do not invent IDs.
+- For broad questions asking for all/history/complete lists, do not return completeness="complete" unless the information gathered across visited pages explicitly supports full coverage.
 - Always omit link IDs from relevantExcerpts
+- task: short imperative instruction stating WHAT the sub-agent should find, using the chosen linked page as ITS starting point (the sub-agent may follow further links from there). E.g. "T1 팀 페이지를 기점으로 시즌별 탑라이너 로스터 추출"
 
 If nothing relevant found:
-{"action": "done", "found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`
+{"action": "done", "found": false, "completeness": "none", "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "missingInfo": []}`
     : `You are a focused research agent with a specific goal.
 Analyze the given web page and find information relevant to the goal. You cannot explore further links.
+${groundingRules}
 
 Respond with JSON only (no markdown code fences):
-{"action": "done", "found": true, "summary": "2-5 sentence digest of relevant findings", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"]}
+{"action": "done", "found": true, "completeness": "complete", "summary": "2-5 sentence digest of relevant findings from this page only", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": []}
+Partial: {"action": "done", "found": true, "completeness": "partial", "summary": "Relevant but incomplete findings from this page only", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": ["what is missing or which verification could not be performed"]}
 
 If nothing relevant found:
-{"action": "done", "found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`;
+{"action": "done", "found": false, "completeness": "none", "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "missingInfo": []}`;
 
   return [
     { role: "system", content: systemContent },
@@ -141,14 +184,20 @@ export function buildExplorerContinueMessage(childReport: ExplorationReport, can
       : "";
 
   const continueHint = canExploreMore
-    ? "Based on this result, decide your next action: explore another page or report your final findings."
-    : "No more pages can be explored. Based on all information collected, provide your final report now.";
+    ? `Based on this child report, decide your next action.
+
+Re-apply the same gate: choose \`done\` only when BOTH hold — (a) no remaining unvisited link on the original page appears likely to add or verify information beyond what is already gathered, AND (b) you have all the verifiable information explicitly required by the goal.
+
+Once you return done, the entire chain of pages reachable from your starting point is locked — you cannot revisit. Your final summary must be based only on information explicitly found across the pages visited — do not supplement with prior knowledge.`
+    : "No more pages can be explored. Based on all information collected from the pages visited, provide your final report. Include only what was explicitly found — do not supplement with prior knowledge.";
 
   return {
     role: "user",
     content: `Child exploration result from ${childReport.url}:
 found: ${childReport.found}
+completeness: ${childReport.completeness}
 summary: ${childReport.summary}${excerptText}
+missingInfo: ${childReport.missingInfo.length ? childReport.missingInfo.join("; ") : "None"}
 
 ${continueHint}`,
   };
@@ -162,9 +211,14 @@ export function buildSynthesisPrompt(userQuery: string, reports: ExplorationRepo
   const findings = reports
     .map((r) => {
       const excerpts = r.relevantExcerpts.length > 0 ? `\nExcerpts:\n${r.relevantExcerpts.map((e) => `- ${e}`).join("\n")}` : "";
-      return `--- Source: ${r.url}\n${r.summary}${excerpts}`;
+      const missing = r.missingInfo.length > 0 ? `\nMissing info: ${r.missingInfo.join("; ")}` : "";
+      return `--- Source: ${r.url}\nCompleteness: ${r.completeness}\n${r.summary}${missing}${excerpts}`;
     })
     .join("\n\n");
+
+  // 할루시네이션 방지 규칙 — 학습 지식으로 공백을 채우는 것을 명시적으로 금지.
+  const groundingRule = `
+Critical: Base your answer strictly on the findings provided above. Do not add, infer, or supplement with prior knowledge. If the findings are incomplete or imprecise for any part of the answer, explicitly state what is known and what is uncertain — do not fill gaps from prior knowledge.`;
 
   const systemContent = serpOnly
     ? `You are a research synthesizer. You receive Google search result snippets for a user's question.
@@ -172,13 +226,14 @@ Write a clear, factual answer that directly addresses the question based on the 
 Do NOT cite any URLs — the actual pages were not visited, so you cannot verify their content.
 If snippets conflict, note the disagreement. If information is insufficient, say so directly.
 Do not mention the search process or internal workings. Write for the end user.
-Do not offer follow-up help or ask if the user wants more information.`
+Do not offer follow-up help or ask if the user wants more information.${groundingRule}`
     : `You are a research synthesizer. You receive findings from web pages explored on behalf of a user's question.
 Write a clear, factual answer (3-6 paragraphs) that directly addresses the question.
 Cite sources inline using the URL from each report, like: (source: https://...).
+Prefer complete findings over partial findings. If only partial findings are available, make that limitation explicit and avoid presenting the answer as exhaustive.
 If reports conflict, note the disagreement. If no useful information was found, say so directly.
 Do not mention the exploration process or internal workings. Write for the end user.
-Do not offer follow-up help or ask if the user wants more information.`;
+Do not offer follow-up help or ask if the user wants more information.${groundingRule}`;
 
   return [
     {

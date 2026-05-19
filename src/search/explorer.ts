@@ -7,10 +7,11 @@
 //      - done: ExplorationReport 반환 (자식 결과를 선별 통합한 summary 포함)
 //   3. 하드 리밋 도달 시 "탐색 불가" 메시지를 주입해 LLM이 done을 반환하도록 유도
 import { convertPage } from "../index.js";
+import { parseJsonResponse } from "./json-utils.js";
 import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
 import { buildExplorerContinueMessage, buildExplorerInitialPrompt, MAX_CHILD_CALLS_PER_AGENT, MAX_DEPTH } from "./prompts.js";
-import type { ExplorationReport, LLMMessage, MissionBrief, TokenUsage } from "./types.js";
+import type { ExplorationReport, LLMMessage, MissionBrief, ReportCompleteness, TokenUsage } from "./types.js";
 
 export async function runExplorationAgent(
   brief: MissionBrief,
@@ -46,34 +47,43 @@ export async function runExplorationAgent(
     const MAX_ROUNDS = MAX_CHILD_CALLS_PER_AGENT + 2;
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
-      const { text, tokenUsage } = await client.complete(brief.agentId, messages);
+      const { text, tokenUsage } = await client.complete(brief.agentId, messages, { jsonResponse: true });
       totalTokenUsage = {
         promptTokens: totalTokenUsage.promptTokens + tokenUsage.promptTokens,
         completionTokens: totalTokenUsage.completionTokens + tokenUsage.completionTokens,
         totalTokens: totalTokenUsage.totalTokens + tokenUsage.totalTokens,
       };
 
-      let parsed: {
+      type ParsedAction = {
         action: "explore" | "done";
         linkId?: string;
-        rationale?: string;
+        task?: string;      // 자식 에이전트에게 전달할 명확한 작업 지시
+        rationale?: string; // 왜 이 링크를 선택했는지 (로그용)
         found?: boolean;
+        completeness?: unknown;
         summary?: string;
-        relevantExcerpts?: string[];
+        relevantExcerpts?: unknown;
+        missingInfo?: unknown;
       };
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = { action: "done", found: false, summary: "Failed to parse LLM response.", relevantExcerpts: [] };
-      }
+      // 관대한 JSON 파서: 코드펜스/주변 prose가 섞여도 첫 번째 JSON 블록을 추출.
+      const parsedOrNull = parseJsonResponse<ParsedAction>(text);
+      const parsed: ParsedAction = parsedOrNull ?? {
+        action: "done",
+        found: false,
+        summary: "Failed to parse LLM response.",
+        relevantExcerpts: [],
+      };
 
       if (parsed.action === "done") {
+        const found = parsed.found ?? false;
         const report: ExplorationReport = {
           agentId: brief.agentId,
           url: brief.url,
-          found: parsed.found ?? false,
-          summary: parsed.summary ?? "",
-          relevantExcerpts: parsed.relevantExcerpts ?? [],
+          found,
+          completeness: normalizeCompleteness(parsed.completeness, found),
+          summary: typeof parsed.summary === "string" ? parsed.summary : "",
+          relevantExcerpts: normalizeStringArray(parsed.relevantExcerpts),
+          missingInfo: found ? normalizeStringArray(parsed.missingInfo) : [],
           tokenUsage: totalTokenUsage,
         };
         await logger.log("exploration_report", brief.agentId, { report });
@@ -97,6 +107,7 @@ export async function runExplorationAgent(
           action: "explore",
           linkId,
           url: entry.url,
+          task: parsed.task,
           rationale: parsed.rationale,
         });
 
@@ -107,7 +118,8 @@ export async function runExplorationAgent(
         const childBrief: MissionBrief = {
           agentId: `${brief.agentId}-${linkId!.toLowerCase()}`,
           parentAgentId: brief.agentId,
-          goal: parsed.rationale ?? brief.goal,
+          // task: 자식 에이전트에게 전달할 명확한 작업 지시 (rationale은 로그용)
+          goal: parsed.task ?? brief.goal,
           url: entry.url,
           parentGoal: brief.parentGoal,
           depth: brief.depth + 1,
@@ -153,8 +165,10 @@ export async function runExplorationAgent(
       agentId: brief.agentId,
       url: brief.url,
       found: false,
+      completeness: "none",
       summary: "탐색 한도 초과로 보고를 완료하지 못했습니다.",
       relevantExcerpts: [],
+      missingInfo: [],
       tokenUsage: totalTokenUsage,
     };
     await logger.log("exploration_report", brief.agentId, { report: fallback });
@@ -165,11 +179,23 @@ export async function runExplorationAgent(
       agentId: brief.agentId,
       url: brief.url,
       found: false,
+      completeness: "none",
       summary: `Page could not be loaded: ${err instanceof Error ? err.message : String(err)}`,
       relevantExcerpts: [],
+      missingInfo: [],
       tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
     await logger.log("exploration_report", brief.agentId, { report });
     return report;
   }
+}
+
+function normalizeCompleteness(completeness: unknown, found: boolean): ReportCompleteness {
+  if (!found) return "none";
+  return completeness === "complete" || completeness === "partial" ? completeness : "partial";
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
 }
