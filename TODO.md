@@ -179,29 +179,26 @@ SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LL
 
 ---
 
-### 현재 구현 상태 (부분 완료 / 재작업 필요)
-
-아래 항목은 완료되었으나, 전체 구조(아젠틱 루프)가 미구현이므로 일부는 재작업 대상이다.
+### 현재 구현 상태 (완료)
 
 - [x] `MissionBrief`에 `depth` 필드 추가
 - [x] 탐색 에이전트 내 `visitedUrls` 중복 방지 로직
-- [ ] **[재작업]** explorer를 아젠틱 루프 구조로 재구현 (`explorer.ts`)
+- [x] explorer를 아젠틱 루프 구조로 재구현 (`explorer.ts`)
   - 페이지 변환 후 초기 messages 배열 구성
   - 루프: LLM 호출 → `explore(linkId)` 또는 `done(summary)` 판단
-  - `explore`: 자식 에이전트 호출, 보고 수신, messages에 자식 보고 append
+  - `explore`: 자식 에이전트 호출, 보고 수신, messages에 자식 보고 append (재구성 금지)
   - `done`: `ExplorationReport` 반환 (자식 결과를 선별 통합한 summary 포함)
-  - `depth >= MAX_DEPTH` 시 explore 판단 무시, 즉시 done 처리
-- [ ] **[재작업]** 새 프롬프트 함수 추가 (`prompts.ts`)
-  - `buildExplorerInitialPrompt(brief, pageMarkdown)` — 첫 LLM 호출: 페이지 분석 + explore/done 판단 요청
-  - `buildExplorerContinueMessage(childReport)` — 자식 보고를 user 메시지로 변환 (append용)
+  - `depth >= MAX_DEPTH` 시 "탐색 불가" 메시지 주입 → LLM이 done 반환하도록 유도
+- [x] 새 프롬프트 함수 추가 (`prompts.ts`)
+  - `buildExplorerInitialPrompt(brief, pageMarkdown)`
+  - `buildExplorerContinueMessage(childReport, canExploreMore)`
   - 기존 `buildExplorerPrompt` 제거
-- [ ] **[재작업]** orchestrator에서 `flattenReports` 제거, 보고 수신 구조 단순화 (`orchestrator.ts`)
-- [ ] **[재작업]** `ExplorationReport`에서 `childReports` 필드 제거 (`types.ts`)
-  - 로거가 이미 `startAgent(agentId, parentAgentId)`로 트리 구조를 추적하므로 중복
-- [ ] 하드코딩 상수 정리:
-  - `MAX_DEPTH = 2` (이미 있음, Phase 5에서 옵션화)
-  - `MAX_CHILD_CALLS_PER_AGENT = 3` 추가 (Phase 5에서 옵션화)
-- [x] logger의 `children` 구조가 재귀 깊이를 자동 반영함 (별도 작업 불필요)
+- [x] orchestrator에서 `flattenReports` 제거 (`orchestrator.ts`)
+- [x] `ExplorationReport`에서 `childReports` 필드 제거 (`types.ts`)
+- [x] 하드코딩 상수:
+  - `MAX_DEPTH = 2` (Phase 5에서 옵션화)
+  - `MAX_CHILD_CALLS_PER_AGENT = 3` (Phase 5에서 옵션화)
+- [x] logger의 `children` 구조가 재귀 깊이를 자동 반영함
 
 ---
 
