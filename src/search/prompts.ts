@@ -76,7 +76,7 @@ Respond with JSON only (no markdown code fences):
 {
   "found": true,
   "summary": "2-5 sentence digest of what was found relevant to the goal",
-  "relevantExcerpts": ["up to 3 short verbatim quotes from the page that support the summary"]
+  "relevantExcerpts": ["up to 3 short verbatim quotes from the page that support the summary — omit link IDs like [L1] and markdown headings like ## Heading"]
 }
 
 If nothing relevant is found:
