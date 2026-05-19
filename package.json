@@ -1,0 +1,25 @@
+{
+  "name": "llm-page-reader",
+  "version": "0.1.0",
+  "description": "Convert web pages into LLM-readable documents with out-of-context link registries.",
+  "type": "module",
+  "bin": {
+    "llm-page": "./dist/cli.js",
+    "llm-search": "./dist/search/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "linkedom": "^0.18.12",
+    "playwright": "^1.60.0",
+    "openai": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  }
+}

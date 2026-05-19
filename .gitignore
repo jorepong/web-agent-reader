@@ -1,0 +1,23 @@
+# 의존성
+node_modules/
+
+# 빌드 결과물
+dist/
+
+# 환경 변수 / API 키
+.env
+.env.*
+
+# 페이지 변환 출력 (개발 중 테스트 결과물)
+out/
+
+# 디버그 로그
+logs/
+*.log
+*.json.log
+
+# macOS
+.DS_Store
+
+# Claude Code 설정 (IDE 도구 전용)
+.claude/
