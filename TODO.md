@@ -59,7 +59,7 @@ node dist/search/cli.js --query "질문" [--debug] [--log-dir ./logs] [--model g
 
 ---
 
-## 3. 현재 구현 상태 (Phase 1 완료)
+## 3. 현재 구현 상태 (Phase 1 완료 / Phase 2 진행 중)
 
 ### 파일 구조
 
@@ -139,35 +139,69 @@ SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LL
 
 ## 5. Phase 2: 재귀 탐색
 
-**목표**: 탐색 에이전트가 페이지를 탐색한 후 더 깊이 들어갈지 스스로 판단하고, 필요하면 하위 탐색 에이전트를 호출한다.
+**목표**: 각 탐색 에이전트가 오케스트레이터와 동일한 구조의 아젠틱 루프를 실행한다. 자식 에이전트를 필요에 따라 반복 호출하고, 수집한 정보를 자율적으로 선별·통합해 단일 보고를 상위에 반환한다.
 
-**설계**:
+---
+
+### 설계: 탐색 에이전트 아젠틱 루프
+
+탐색 에이전트는 고정된 1회성 작업자가 아니라, 오케스트레이터와 동일한 루프 구조를 갖는 **미니 오케스트레이터**다.
 
 ```
-explorer-1 (depth=1)
-  → 페이지 탐색
-  → [LLM] 판단:
-      - 충분한 정보 확보 → 상위에 보고
-      - 더 깊이 탐색 필요 → 링크 선택 → explorer-1-1 (depth=2) 호출
-          → explorer-1-1 보고 수신
-          → 추가 탐색 여부 재판단
-  → 최종 보고 상위에 전달
+[Explorer, depth=N]
+  1. convertPage(url) → 페이지 마크다운 획득
+  2. 초기 messages 구성: [system, user(goal + page_markdown)]
+  3. 루프 (최대 MAX_CHILD_CALLS_PER_AGENT=3회):
+       [LLM] 판단:
+         explore(linkId, rationale)
+           → 해당 링크로 자식 에이전트 실행 (depth=N+1)
+           → 자식 ExplorationReport 수신
+           → messages에 자식 보고 append (messages 재구성 금지)
+           → 루프 계속
+         done(found, summary, relevantExcerpts)
+           → 루프 종료
+           → ExplorationReport 반환 (부모에게)
+  ※ depth >= MAX_DEPTH 이면 explore 판단이 나와도 자식 호출 안 함, 즉시 done으로 처리
 ```
 
-**구현 항목**:
-- [ ] `MissionBrief`에 `depth` 필드 추가
-- [ ] explorer가 `links.json`의 링크 ID를 보고 하위 탐색 대상 선택
-- [ ] 하위 explorer 호출 및 보고 수신
-- [ ] 하위 보고를 자신의 컨텍스트에 append (재구성 금지)
-- [ ] 최대 깊이 도달 시 강제 종료 후 현재까지 수집한 정보로 보고
-- [ ] 하드코딩 최대 깊이: 2 (Phase 5에서 옵션화)
-- [ ] logger의 `children` 구조가 재귀 깊이를 자동 반영함 (별도 작업 불필요)
+**핵심 원칙**:
+- 자식 보고를 상위 에이전트가 직접 보지 않는다. 깊이 N+1의 보고는 깊이 N 에이전트에게만 전달된다.
+- 깊이 N 에이전트는 자신의 목적 기준으로 자식 보고를 평가하고, 관련 있는 내용만 자신의 `summary`에 통합한다. 자식 보고 전체를 상위에 올리지 않는다.
+- 오케스트레이터는 `flattenReports` 없이 최상위 explorer의 단일 보고만 수신한다.
+- 컨텍스트 append만 허용 (재구성 금지): 자식 보고를 받을 때마다 기존 messages 배열 끝에 추가. prefix cache 히트율 유지 목적.
+- 하드 리밋(MAX_DEPTH, MAX_CHILD_CALLS_PER_AGENT)은 비용 폭발 방지 안전장치일 뿐, 탐색 구조를 규정하지 않는다.
 
-**재귀 종료 조건** (LLM이 판단):
-- 현재 페이지에서 충분한 정보를 찾았을 때
+**탐색 종료 조건** (LLM 자율 판단):
+- 목표에 충분한 정보를 확보했을 때
 - 탐색할 만한 관련 링크가 없을 때
-- 중복 정보만 반복될 때
-- 최대 깊이 도달 (하드 리밋)
+- 자식 에이전트가 반복적으로 무관한 정보만 가져올 때
+- 하드 리밋 도달 (강제 종료)
+
+---
+
+### 현재 구현 상태 (부분 완료 / 재작업 필요)
+
+아래 항목은 완료되었으나, 전체 구조(아젠틱 루프)가 미구현이므로 일부는 재작업 대상이다.
+
+- [x] `MissionBrief`에 `depth` 필드 추가
+- [x] 탐색 에이전트 내 `visitedUrls` 중복 방지 로직
+- [ ] **[재작업]** explorer를 아젠틱 루프 구조로 재구현 (`explorer.ts`)
+  - 페이지 변환 후 초기 messages 배열 구성
+  - 루프: LLM 호출 → `explore(linkId)` 또는 `done(summary)` 판단
+  - `explore`: 자식 에이전트 호출, 보고 수신, messages에 자식 보고 append
+  - `done`: `ExplorationReport` 반환 (자식 결과를 선별 통합한 summary 포함)
+  - `depth >= MAX_DEPTH` 시 explore 판단 무시, 즉시 done 처리
+- [ ] **[재작업]** 새 프롬프트 함수 추가 (`prompts.ts`)
+  - `buildExplorerInitialPrompt(brief, pageMarkdown)` — 첫 LLM 호출: 페이지 분석 + explore/done 판단 요청
+  - `buildExplorerContinueMessage(childReport)` — 자식 보고를 user 메시지로 변환 (append용)
+  - 기존 `buildExplorerPrompt` 제거
+- [ ] **[재작업]** orchestrator에서 `flattenReports` 제거, 보고 수신 구조 단순화 (`orchestrator.ts`)
+- [ ] **[재작업]** `ExplorationReport`에서 `childReports` 필드 제거 (`types.ts`)
+  - 로거가 이미 `startAgent(agentId, parentAgentId)`로 트리 구조를 추적하므로 중복
+- [ ] 하드코딩 상수 정리:
+  - `MAX_DEPTH = 2` (이미 있음, Phase 5에서 옵션화)
+  - `MAX_CHILD_CALLS_PER_AGENT = 3` 추가 (Phase 5에서 옵션화)
+- [x] logger의 `children` 구조가 재귀 깊이를 자동 반영함 (별도 작업 불필요)
 
 ---
 
