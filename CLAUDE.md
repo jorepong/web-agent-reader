@@ -62,7 +62,7 @@ import 경로에 `.js` 확장자 필수 (NodeNext 규칙).
 ConvertResult = { page: PageAst, markdown: string, links: LinkRegistry, elements: ElementRegistry }
 
 // 에이전트 간 통신
-MissionBrief    — 상위 → 하위 에이전트 지시 (agentId, parentAgentId, goal, url, parentGoal)
+MissionBrief    — 상위 → 하위 에이전트 지시 (agentId, parentAgentId, goal, url, parentGoal, depth)
 ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary, relevantExcerpts, tokenUsage)
 ```
 
@@ -91,19 +91,29 @@ ExplorationReport — 하위 → 상위 에이전트 보고 (url, found, summary
 `runSearch(options)` 흐름:
 1. [LLM] 검색 쿼리 생성 (한국어 → 영어 등 최적화)
 2. `convertPage(googleUrl, { scroll: false, stealth: true })` — SERP 변환
-3. `extractSerpSnippets(markdown)` — Main Content 스니펫만 추출 (루프 전 1회 실행)
+3. `extractSerpSnippets(markdown, keepLinkIds=true)` — Main Content 스니펫 추출 (링크 ID 유지)
 4. 루프 (최대 MAX_PAGES=5):
    - [LLM] 판단: explore(linkId 선택) or done
-   - explore → `runExplorationAgent(brief)` 실행 후 보고 수신
+   - explore → `runExplorationAgent(brief)` 실행 → 탐색 에이전트 아젠틱 루프 실행 → 보고 수신
 5. [LLM] 수집된 보고로 최종 답변 합성
 
-**SERP 기반 합성 특이 동작**: SERP에서 충분한 정보를 얻으면 탐색 없이 즉시 합성.
-이 경우 `serpOnly=true`로 합성 프롬프트에 전달 → URL 인용 금지 (실제 방문 안 함).
+**탐색 에이전트 아젠틱 루프** (`runExplorationAgent` 내부):
+- 페이지 변환 후 초기 messages 구성
+- 루프 (최대 MAX_CHILD_CALLS_PER_AGENT=3회):
+  - [LLM] 판단: `explore(linkId)` or `done(summary)`
+  - explore → 자식 에이전트 실행, 보고 수신, messages에 append (재구성 금지)
+  - done → ExplorationReport 반환 (자식 결과를 선별 통합한 summary 포함)
+- depth >= MAX_DEPTH(2) 시 explore 판단 무시, "탐색 불가" 메시지 주입 후 done 유도
 
-`extractSerpSnippets()` 제거 대상: Navigation/Footer/Aside 섹션, `[LN]` 링크 ID, `Translate this page` / `Read more` / `Missing:` 텍스트, 섹션 헤더.
+**SERP 기반 합성 특이 동작**: 탐색이 없거나 모든 탐색이 `found=false`이면 SERP 스니펫으로 합성.
+이 경우 `useSerpSynthesis=true`로 합성 프롬프트에 전달 → URL 인용 금지 (실제 방문 안 함).
+
+`extractSerpSnippets()`:
+- 오케스트레이터 판단 루프용: `keepLinkIds=true` — LLM이 linkId로 탐색 대상 선택
+- 합성용: `keepLinkIds=false` — 방문하지 않은 URL 인용 방지
 
 **주의**: `[LN]` 링크 ID는 탐색 에이전트 페이지 마크다운에서 제거하면 안 됨.
-Phase 2 재귀 탐색에서 에이전트가 어떤 링크로 내려갈지 결정할 때 필요.
+에이전트가 `explore` 결정 시 `suggestedLinkId`를 링크 레지스트리에서 조회하기 때문.
 
 ---
 
@@ -131,6 +141,15 @@ Phase 2 재귀 탐색에서 에이전트가 어떤 링크로 내려갈지 결정
 }
 ```
 
+기록 이벤트 종류:
+- `llm_request` / `llm_response` — LLM 호출 입출력 + 토큰 사용량
+- `page_markdown` — convertPage로 변환된 페이지 전문
+- `mission_brief` — 상위 → 하위 에이전트 지시
+- `exploration_report` — 하위 → 상위 에이전트 보고
+- `orchestrator_plan` — 오케스트레이터의 매 라운드 판단 (explore/done)
+- `recursion_decision` — 탐색 에이전트 루프의 매 라운드 판단 (explore/done/skipped)
+- `final_answer` — 최종 답변
+
 `logger.finalize()`는 프로세스 종료 전(성공/실패 모두) 반드시 호출해야 함. `cli.ts`의 try/catch 양쪽에서 호출.
 
 ---
@@ -152,7 +171,7 @@ Phase 2 재귀 탐색에서 에이전트가 어떤 링크로 내려갈지 결정
 | Phase | 상태 | 내용 |
 |-------|------|------|
 | 1 | 완료 | 단일 깊이 직렬 탐색 CLI |
-| 2 | 미구현 | 탐색 에이전트 재귀 탐색 |
+| 2 | 완료 | 탐색 에이전트 아젠틱 루프 |
 | 3 | 미구현 | 병렬 에이전트 호출 |
 | 4 | 미구현 | 지능적 종료 강화 |
 | 5 | 미구현 | CLI 옵션 고도화 |
