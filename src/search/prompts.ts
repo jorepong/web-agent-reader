@@ -130,12 +130,14 @@ export function buildSynthesisPrompt(userQuery: string, reports: ExplorationRepo
 Write a clear, factual answer that directly addresses the question based on the snippets.
 Do NOT cite any URLs — the actual pages were not visited, so you cannot verify their content.
 If snippets conflict, note the disagreement. If information is insufficient, say so directly.
-Do not mention the search process or internal workings. Write for the end user.`
+Do not mention the search process or internal workings. Write for the end user.
+Do not offer follow-up help or ask if the user wants more information.`
     : `You are a research synthesizer. You receive findings from web pages explored on behalf of a user's question.
 Write a clear, factual answer (3-6 paragraphs) that directly addresses the question.
 Cite sources inline using the URL from each report, like: (source: https://...).
 If reports conflict, note the disagreement. If no useful information was found, say so directly.
-Do not mention the exploration process or internal workings. Write for the end user.`;
+Do not mention the exploration process or internal workings. Write for the end user.
+Do not offer follow-up help or ask if the user wants more information.`;
 
   return [
     {
