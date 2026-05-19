@@ -1,7 +1,20 @@
+// 모든 LLM 프롬프트 템플릿을 한곳에서 관리.
+// 프롬프트 변경은 반드시 이 파일에서만 수행한다.
 import type { ExplorationReport, LLMMessage, MissionBrief } from "./types.js";
 
+// 탐색 에이전트의 재귀 최대 깊이.
+// depth 0 에이전트는 자식을 만들 수 있고(depth 1), depth 1은 자식(depth 2)을 만들 수 있다.
+// depth 2(= MAX_DEPTH)부터는 재귀 없이 현재 페이지 분석만 수행.
+// Phase 5에서 CLI 옵션 --max-depth로 옵션화 예정.
 export const MAX_DEPTH = 2;
 
+// 한 탐색 에이전트가 자식을 호출할 수 있는 최대 횟수 (비용 폭발 방지).
+// 실제 LLM 호출 수는 최대 MAX_CHILD_CALLS_PER_AGENT + 2회 (초기 + 자식들 + 마지막 done).
+// Phase 5에서 CLI 옵션으로 옵션화 예정.
+export const MAX_CHILD_CALLS_PER_AGENT = 3;
+
+// 사용자 질문을 Google 검색에 최적화된 영어 쿼리로 변환.
+// 한국어 질문을 그대로 Google에 넣으면 영어 자료 접근이 제한되므로 사전 변환.
 export function buildSearchQueryPrompt(userQuery: string): LLMMessage[] {
   return [
     {
@@ -16,6 +29,10 @@ export function buildSearchQueryPrompt(userQuery: string): LLMMessage[] {
   ];
 }
 
+// 오케스트레이터가 매 라운드 SERP를 보고 "더 탐색할지 / 종료할지" 판단하는 프롬프트.
+// serpMarkdown: 링크 ID가 포함된 SERP 스니펫 (keepLinkIds=true로 추출).
+//   링크 ID를 남겨두는 이유 — LLM이 linkId를 응답에 명시해야 하는데, 없으면 할루시네이션.
+// reports: 상위 레벨 탐색 보고만 포함 (자식 보고는 explorer가 선별해 summary에 통합).
 export function buildNextActionPrompt(
   userQuery: string,
   serpMarkdown: string,
@@ -69,54 +86,78 @@ ${findingsSummary}`,
   ];
 }
 
-export function buildExplorerPrompt(brief: MissionBrief, pageMarkdown: string): LLMMessage[] {
-  const canGoDeeper = brief.depth < MAX_DEPTH;
+// 탐색 에이전트 아젠틱 루프의 초기 프롬프트.
+// 페이지를 분석하고 explore / done 중 하나를 결정하도록 요청.
+// depth >= MAX_DEPTH: 더 이상 자식 호출 불가 → done만 허용하는 별도 시스템 메시지 사용.
+export function buildExplorerInitialPrompt(brief: MissionBrief, pageMarkdown: string): LLMMessage[] {
+  const canExplore = brief.depth < MAX_DEPTH;
 
-  const systemContent = canGoDeeper
-    ? `You are a focused research assistant. You receive a web page in Markdown and a specific goal.
-Extract only information relevant to the goal. Do not summarize the whole page.
+  const systemContent = canExplore
+    ? `You are a focused research agent with a specific goal.
+Analyze the given web page and find information relevant to the goal.
 
-Link IDs in the page look like [L1], [L2], etc. After extracting relevant information, decide if you need to explore a linked page for more detail.
+After analysis, decide your next action:
+1. Explore — if a specific linked page clearly contains more relevant information not present here
+2. Done — if you have sufficient information, or no valuable links exist
+
+Link IDs look like [L1], [L2], etc. You can explore at most ${MAX_CHILD_CALLS_PER_AGENT} links total.
 
 Respond with JSON only (no markdown code fences):
-{
-  "found": true,
-  "summary": "2-5 sentence digest of what was found relevant to the goal",
-  "relevantExcerpts": ["up to 3 short verbatim quotes from the page that support the summary — omit link IDs like [L1] and markdown headings like ## Heading"],
-  "shouldExploreDeeper": false,
-  "suggestedLinkIds": []
-}
+Explore: {"action": "explore", "linkId": "L3", "rationale": "Why this link is worth exploring"}
+Done:    {"action": "done", "found": true, "summary": "2-5 sentence digest of relevant findings", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"]}
 
-Rules for shouldExploreDeeper and suggestedLinkIds:
-- Set shouldExploreDeeper=true ONLY if a linked page clearly contains more specific, relevant information not present here
-- Suggest at most 3 link IDs (e.g. ["L3", "L7"]) — pick the most promising ones
-- If you already found sufficient information, or no relevant links exist: shouldExploreDeeper=false, suggestedLinkIds=[]
+Rules:
+- Only explore if it would meaningfully add to your findings
+- The linkId MUST appear in the page content above. Do not invent IDs.
 - Always omit link IDs from relevantExcerpts
 
-If nothing relevant is found:
-{"found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "shouldExploreDeeper": false, "suggestedLinkIds": []}`
-    : `You are a focused research assistant. You receive a web page in Markdown and a specific goal.
-Extract only information relevant to the goal. Do not summarize the whole page.
+If nothing relevant found:
+{"action": "done", "found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`
+    : `You are a focused research agent with a specific goal.
+Analyze the given web page and find information relevant to the goal. You cannot explore further links.
 
 Respond with JSON only (no markdown code fences):
-{
-  "found": true,
-  "summary": "2-5 sentence digest of what was found relevant to the goal",
-  "relevantExcerpts": ["up to 3 short verbatim quotes from the page that support the summary — omit link IDs like [L1] and markdown headings like ## Heading"]
-}
+{"action": "done", "found": true, "summary": "2-5 sentence digest of relevant findings", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"]}
 
-If nothing relevant is found:
-{"found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`;
+If nothing relevant found:
+{"action": "done", "found": false, "summary": "Page did not contain relevant information.", "relevantExcerpts": []}`;
 
   return [
     { role: "system", content: systemContent },
     {
       role: "user",
-      content: `Goal: ${brief.goal}\nOriginal user question: ${brief.parentGoal}\n\nPage content:\n${pageMarkdown}`,
+      content: `Goal: ${brief.goal}\nOriginal question: ${brief.parentGoal}\n\nPage content:\n${pageMarkdown}`,
     },
   ];
 }
 
+// 자식 에이전트 보고를 받은 후 context에 append하는 user 메시지.
+// 호출 순서: messages.push({role:"assistant", content: prevText}) → messages.push(이 함수 결과)
+// canExploreMore: 아직 자식 호출 여유가 있는지 — LLM이 다음 행동을 결정하는 데 사용.
+export function buildExplorerContinueMessage(childReport: ExplorationReport, canExploreMore: boolean): LLMMessage {
+  const excerptText =
+    childReport.relevantExcerpts.length > 0
+      ? `\nKey excerpts:\n${childReport.relevantExcerpts.map((e) => `  - ${e}`).join("\n")}`
+      : "";
+
+  const continueHint = canExploreMore
+    ? "Based on this result, decide your next action: explore another page or report your final findings."
+    : "No more pages can be explored. Based on all information collected, provide your final report now.";
+
+  return {
+    role: "user",
+    content: `Child exploration result from ${childReport.url}:
+found: ${childReport.found}
+summary: ${childReport.summary}${excerptText}
+
+${continueHint}`,
+  };
+}
+
+// 합성 프롬프트.
+// serpOnly=true: 실제 페이지를 방문하지 않았거나 모든 탐색이 실패한 경우.
+//   URL 인용 금지 — 방문하지 않은 페이지를 출처로 인용하면 신뢰도 문제.
+// serpOnly=false: 탐색 성공 시. 방문한 URL을 출처로 명시적으로 인용.
 export function buildSynthesisPrompt(userQuery: string, reports: ExplorationReport[], serpOnly: boolean): LLMMessage[] {
   const findings = reports
     .map((r) => {

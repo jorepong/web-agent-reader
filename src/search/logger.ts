@@ -1,3 +1,10 @@
+// 디버그 로거. 에이전트 계층을 반영한 JSON 트리 파일을 생성한다.
+//
+// 설계 원칙:
+//   - 모든 이벤트를 메모리에 누적한 뒤 finalize()에서 일괄 저장.
+//     단점: 크래시 시 로그 유실. 장점: 에이전트 트리를 정확히 구성할 수 있음.
+//   - 에이전트 깊이(depth)는 startAgent() 호출 시 parentAgentId를 기반으로 자동 계산.
+//     MissionBrief의 depth와는 별개 — 로거가 독립적으로 트리를 추적.
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { LogEventKind } from "./types.js";
@@ -19,6 +26,7 @@ interface AgentNode {
 export class DebugLogger {
   private filePath: string;
   private enabled: boolean;
+  // Map 순서 = 에이전트 등록 순서 → buildTree()에서 children 정렬 시 활용
   private agents: Map<string, AgentNode> = new Map();
 
   constructor(enabled: boolean, logDir = ".") {
@@ -33,6 +41,9 @@ export class DebugLogger {
     console.log(`디버그 로그: ${this.filePath}`);
   }
 
+  // 에이전트를 등록하고 깊이를 계산한다.
+  // 부모가 아직 등록되지 않은 경우(parentAgentId가 Map에 없음) depth를 0으로 설정하는데,
+  // 이는 오케스트레이터(parentAgentId=null)가 항상 먼저 등록된다는 전제 하에 안전.
   startAgent(agentId: string, parentAgentId: string | null): void {
     if (!this.enabled) return;
     const parentDepth = parentAgentId ? (this.agents.get(parentAgentId)?.depth ?? -1) : -1;
@@ -45,6 +56,7 @@ export class DebugLogger {
     });
   }
 
+  // agentId가 Map에 없으면 이벤트를 조용히 버린다 — 크래시 없이 진행.
   async log(kind: LogEventKind, agentId: string, payload: unknown): Promise<void> {
     if (!this.enabled) return;
     this.printStatus(kind, agentId, payload);
@@ -54,6 +66,7 @@ export class DebugLogger {
     }
   }
 
+  // 성공/실패 양쪽 경로에서 반드시 호출해야 한다 (cli.ts의 try/catch 참고).
   async finalize(): Promise<void> {
     if (!this.enabled || this.agents.size === 0) return;
     try {
@@ -63,6 +76,8 @@ export class DebugLogger {
     }
   }
 
+  // 에이전트 Map을 순회해 parentAgentId 기반으로 트리를 재귀 구성한다.
+  // 루트가 정확히 하나면 객체로, 여러 개면 배열로 반환 (정상 상황은 항상 단일 루트).
   private buildTree(): unknown {
     const buildNode = (node: AgentNode): unknown => ({
       agentId: node.agentId,
@@ -79,6 +94,7 @@ export class DebugLogger {
     return roots.length === 1 ? buildNode(roots[0]) : roots.map(buildNode);
   }
 
+  // 터미널 실시간 출력 — stderr에 기록해 stdout(최종 답변)과 분리.
   private printStatus(kind: LogEventKind, agentId: string, payload: unknown): void {
     const p = payload as Record<string, unknown>;
     const tag = `[${agentId}]`;
@@ -120,13 +136,12 @@ export class DebugLogger {
         break;
       }
       case "recursion_decision": {
+        const round = p["round"] as number;
         const depth = p["depth"] as number;
-        const shouldExplore = p["shouldExploreDeeper"] as boolean;
-        const linkIds = (p["suggestedLinkIds"] as string[]) ?? [];
-        if (shouldExplore) {
-          process.stderr.write(`${tag} [depth=${depth}] 재귀 탐색 결정 → ${linkIds.join(", ")}\n`);
+        if (p["action"] === "explore") {
+          process.stderr.write(`${tag} [round=${round}, depth=${depth}] 재귀 탐색 → ${p["url"]} (${p["linkId"]})\n`);
         } else {
-          process.stderr.write(`${tag} [depth=${depth}] 재귀 탐색 불필요\n`);
+          process.stderr.write(`${tag} [round=${round}, depth=${depth}] 재귀 건너뜀 — ${p["reason"]}\n`);
         }
         break;
       }
