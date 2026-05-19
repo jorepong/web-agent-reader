@@ -49,7 +49,9 @@ Rules:
 
 Respond with JSON only (no markdown code fences):
 Explore: {"action": "explore", "linkId": "L5", "rationale": "Why this page is worth exploring next"}
-Stop:    {"action": "done", "reason": "Why current findings are sufficient"}`,
+Stop:    {"action": "done", "reason": "Why current findings are sufficient"}
+
+The linkId MUST be one of the IDs (e.g. [L5]) visible in the search results above. Do not invent IDs.`,
     },
     {
       role: "user",

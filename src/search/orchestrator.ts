@@ -7,7 +7,18 @@ import type { ExplorationReport, MissionBrief, SearchOptions } from "./types.js"
 
 const MAX_PAGES = 5;
 
-function extractSerpSnippets(markdown: string): string {
+function flattenReports(reports: ExplorationReport[]): ExplorationReport[] {
+  const result: ExplorationReport[] = [];
+  for (const report of reports) {
+    result.push(report);
+    if (report.childReports?.length) {
+      result.push(...flattenReports(report.childReports));
+    }
+  }
+  return result;
+}
+
+function extractSerpSnippets(markdown: string, keepLinkIds = false): string {
   const mainMatch = markdown.match(/## Main Content\n([\s\S]*?)(?=\n## |$)/);
   const main = mainMatch ? mainMatch[1] : markdown;
 
@@ -15,7 +26,7 @@ function extractSerpSnippets(markdown: string): string {
 
   return main
     .split("\n")
-    .map((line) => line.replace(/\s*\[L\d+\]/g, "").trim())
+    .map((line) => (keepLinkIds ? line.trim() : line.replace(/\s*\[L\d+\]/g, "").trim()))
     .filter((line) => {
       if (!line) return false;
       if (skipPrefixes.some((p) => line.startsWith(p))) return false;
@@ -45,7 +56,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   });
 
   // Step 3: agentic exploration loop
-  const serpSnippets = extractSerpSnippets(serpResult.markdown);
+  const serpSnippets = extractSerpSnippets(serpResult.markdown, true); // 링크 ID 유지: 오케스트레이터가 linkId로 탐색 대상 선택
   const reports: ExplorationReport[] = [];
   const exploredUrls: string[] = [];
 
@@ -69,7 +80,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
     if (!action.linkId) break;
     const entry = serpResult.links.links[action.linkId];
-    if (!entry || exploredUrls.includes(entry.url)) break;
+    if (!entry || exploredUrls.includes(entry.url)) continue;
 
     await logger.log("orchestrator_plan", "orchestrator", {
       round,
@@ -87,6 +98,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       goal: action.rationale ?? options.query,
       url: entry.url,
       parentGoal: options.query,
+      depth: 0,
     };
 
     const report = await runExplorationAgent(brief, client, logger);
@@ -94,23 +106,23 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   }
 
   // Step 4: synthesize final answer
-  // SERP 자체에서 충분한 정보를 얻어 탐색 없이 종료한 경우, SERP를 소스로 합성
-  const serpOnly = reports.length === 0;
-  if (serpOnly) {
-    reports.push({
-      agentId: "orchestrator",
-      url: googleUrl,
-      found: true,
-      summary: extractSerpSnippets(serpResult.markdown),
-      relevantExcerpts: [],
-      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-    });
-  }
+  const allReports = flattenReports(reports);
+  const usefulReports = allReports.filter((r) => r.found);
 
-  const usefulReports = reports.filter((r) => r.found);
-  const reportsForSynthesis = usefulReports.length > 0 ? usefulReports : reports;
+  // 탐색이 없었거나 모든 탐색이 found=false인 경우 → SERP 스니펫으로 합성
+  const useSerpSynthesis = usefulReports.length === 0;
+  const reportsForSynthesis: ExplorationReport[] = useSerpSynthesis
+    ? [{
+        agentId: "orchestrator",
+        url: googleUrl,
+        found: true,
+        summary: extractSerpSnippets(serpResult.markdown, false), // 링크 ID 제거: 실제 방문 안 한 URL 인용 방지
+        relevantExcerpts: [],
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      }]
+    : usefulReports;
 
-  const { text: answer } = await client.complete("orchestrator", buildSynthesisPrompt(options.query, reportsForSynthesis, serpOnly));
+  const { text: answer } = await client.complete("orchestrator", buildSynthesisPrompt(options.query, reportsForSynthesis, useSerpSynthesis));
   await logger.log("final_answer", "orchestrator", { answer });
   return answer;
 }
