@@ -96,9 +96,10 @@ ExplorationReport — 하위 → 상위 에이전트 보고
 1. [LLM] 검색 쿼리 생성 (한국어 → 영어 등 최적화)
 2. `convertPage(googleUrl, { scroll: false, stealth: true })` — SERP 변환
 3. `extractSerpSnippets(markdown, keepLinkIds=true)` — Main Content 스니펫 추출 (링크 ID 유지)
-4. 루프 (최대 MAX_PAGES=5):
-   - [LLM] 판단: explore(linkId 선택) or done
+4. 루프 (라운드 ≤ MAX_PAGES=5 AND 누적 페이지 < MAX_PAGES):
+   - [LLM] 판단: explore(linkId 선택) / explore_parallel(branches[]) / done
    - explore → `runExplorationAgent(brief)` 실행 → 탐색 에이전트 아젠틱 루프 실행 → 보고 수신
+   - explore_parallel → 최대 MAX_PARALLEL=3개의 독립 브랜치를 `Promise.all`로 동시 실행, 보고 일괄 수집
 5. [LLM] 수집된 보고로 최종 답변 합성
 
 **탐색 에이전트 아젠틱 루프** (`runExplorationAgent` 내부):
@@ -174,6 +175,6 @@ ISO 8601 타임스탬프 문자열 정렬 = 시간순 정렬을 활용해 finali
 |-------|------|------|
 | 1 | 완료 | 단일 깊이 직렬 탐색 CLI |
 | 2 | 완료 | 탐색 에이전트 아젠틱 루프 |
-| 3 | 미구현 | 병렬 에이전트 호출 |
+| 3 | 완료 | 오케스트레이터 레벨 병렬 에이전트 호출 (`explore_parallel`) |
 | 4 | 미구현 | 지능적 종료 강화 |
 | 5 | 미구현 | CLI 옵션 고도화 |

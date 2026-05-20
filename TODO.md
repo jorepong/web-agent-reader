@@ -202,7 +202,7 @@ SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LL
 
 ---
 
-## 6. Phase 3: 병렬 호출
+## 6. Phase 3: 병렬 호출 (완료)
 
 **목표**: 독립적인 탐색 브랜치를 동시에 실행해 전체 탐색 시간을 줄인다.
 
@@ -211,12 +211,18 @@ SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LL
 - 직렬 유지 조건: 이전 탐색 결과를 보고 다음 탐색 대상을 결정해야 하는 경우
 - 어떤 것을 병렬로 실행할지도 LLM이 판단
 
-**구현 항목**:
-- [ ] 오케스트레이터가 "병렬 탐색 가능한 링크 목록"을 한 번에 선택하는 판단 모드 추가
-- [ ] `Promise.all` 기반 병렬 explorer 실행
-- [ ] 병렬 보고 결과 수집 및 병합
-- [ ] 하드코딩 최대 병렬 수: 3 (Phase 5에서 옵션화)
-- [ ] 주의: Playwright 브라우저가 동시에 여러 개 실행됨 → 메모리 사용량 증가 감안
+**현재 구현 상태 (오케스트레이터 레벨)**:
+- [x] 오케스트레이터 프롬프트에 `explore_parallel` 액션 추가 — LLM이 한 라운드에서 2-`MAX_PARALLEL`개의 독립 브랜치를 선택
+- [x] `Promise.all` 기반 병렬 explorer 실행 (`orchestrator.ts`)
+- [x] 병렬 보고 결과 수집 및 병합 (`reports.push(...parallelReports)`)
+- [x] `MAX_PARALLEL = 3` 상수 (`prompts.ts`) — Phase 5에서 `--max-parallel`로 옵션화 예정
+- [x] 루프 상한 이중화: `round ≤ MAX_PAGES` AND `exploredUrls.length < MAX_PAGES` (병렬 배치가 페이지 예산을 더 빨리 소진)
+- [x] 같은 배치 내 URL/linkId 중복 차단, 무효 branch 전부 폴백 시 `continue`로 다음 라운드 유도
+- [x] `orchestrator_plan` 로그에 `branches[]` 페이로드 추가, stderr 출력도 분기 처리
+
+**남은 검토 항목**:
+- [ ] 탐색 에이전트(explorer) 내부 자식 호출 병렬화는 별도 작업 (Phase 3에서는 오케스트레이터 레벨만 다룸)
+- [ ] Playwright 브라우저 동시 실행 시 메모리 사용량 모니터링 — 실사용 케이스에서 관찰 필요
 
 ---
 
