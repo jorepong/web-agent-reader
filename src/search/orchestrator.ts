@@ -5,7 +5,7 @@ import { runExplorationAgent } from "./explorer.js";
 import { parseJsonResponse } from "./json-utils.js";
 import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
-import { buildNextActionPrompt, buildSearchQueryPrompt, buildSynthesisPrompt } from "./prompts.js";
+import { buildNextActionPrompt, buildSearchQueryPrompt, buildSynthesisPrompt, MAX_PARALLEL } from "./prompts.js";
 import type { ExplorationReport, MissionBrief, SearchOptions } from "./types.js";
 
 // 오케스트레이터 레벨에서 탐색할 수 있는 최대 페이지 수 (비용 폭발 방지 안전장치).
@@ -62,7 +62,10 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   // exploredUrls: 오케스트레이터 레벨 중복 방지 (explorer 내부 visitedUrls와 별개)
   const exploredUrls: string[] = [];
 
-  for (let round = 1; round <= MAX_PAGES; round++) {
+  // 루프 상한 두 개를 동시에 적용:
+  //   - round <= MAX_PAGES: LLM 판단 횟수 상한 (잘못된 action이 반복돼 무한 루프되는 것 방지)
+  //   - exploredUrls.length < MAX_PAGES: 실제 페이지 수 상한 (병렬 라운드가 단일 라운드보다 빨리 소진)
+  for (let round = 1; round <= MAX_PAGES && exploredUrls.length < MAX_PAGES; round++) {
     const { text: actionJson } = await client.complete(
       "orchestrator",
       buildNextActionPrompt(options.query, serpSnippets, reports, exploredUrls, MAX_PAGES),
@@ -71,11 +74,12 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
     // 관대한 JSON 파서: 코드펜스/주변 prose가 섞여도 첫 번째 JSON 블록을 추출.
     const action = parseJsonResponse<{
-      action: "explore" | "done";
+      action: "explore" | "explore_parallel" | "done";
       linkId?: string;
       task?: string;
       rationale?: string;
       reason?: string;
+      branches?: Array<{ linkId?: string; task?: string; rationale?: string }>;
     }>(actionJson);
     if (!action) {
       // JSON 파싱 실패 = LLM 응답 오류, 더 이상 탐색 불가
@@ -85,6 +89,56 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
     if (action.action === "done") {
       await logger.log("orchestrator_plan", "orchestrator", { round, action: "done", reason: action.reason });
       break;
+    }
+
+    if (action.action === "explore_parallel") {
+      // 남은 페이지 예산과 MAX_PARALLEL 중 작은 값까지만 동시 실행
+      const remainingBudget = MAX_PAGES - exploredUrls.length;
+      const limit = Math.min(MAX_PARALLEL, remainingBudget);
+
+      const rawBranches = Array.isArray(action.branches) ? action.branches : [];
+      // 유효한 branch만 수집: linkId 존재 + 미방문 + 같은 배치 내 URL 중복 없음
+      const validBranches: Array<{ linkId: string; task?: string; rationale?: string; url: string }> = [];
+      for (const b of rawBranches) {
+        if (!b || !b.linkId) continue;
+        const entry = serpResult.links.links[b.linkId];
+        if (!entry) continue;
+        if (exploredUrls.includes(entry.url)) continue;
+        if (validBranches.some((vb) => vb.url === entry.url)) continue;
+        validBranches.push({ linkId: b.linkId, task: b.task, rationale: b.rationale, url: entry.url });
+        if (validBranches.length >= limit) break;
+      }
+
+      // 유효한 branch가 하나도 없으면 다음 라운드에 LLM이 다시 선택하도록 continue
+      if (validBranches.length === 0) continue;
+
+      // 모든 URL을 먼저 등록해 동일 배치 내 충돌 방지
+      for (const vb of validBranches) {
+        exploredUrls.push(vb.url);
+      }
+
+      await logger.log("orchestrator_plan", "orchestrator", {
+        round,
+        action: "explore_parallel",
+        rationale: action.rationale,
+        branches: validBranches.map((vb) => ({ linkId: vb.linkId, url: vb.url, task: vb.task, rationale: vb.rationale })),
+      });
+
+      const parallelReports = await Promise.all(
+        validBranches.map((vb, i) => {
+          const brief: MissionBrief = {
+            agentId: `explorer-${round}-${i + 1}`,
+            parentAgentId: "orchestrator",
+            goal: vb.task ?? options.query,
+            url: vb.url,
+            parentGoal: options.query,
+            depth: 0,
+          };
+          return runExplorationAgent(brief, client, logger);
+        })
+      );
+      reports.push(...parallelReports);
+      continue;
     }
 
     if (!action.linkId) break;

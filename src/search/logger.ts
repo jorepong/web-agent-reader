@@ -137,6 +137,13 @@ export class DebugLogger {
         const round = p["round"] as number;
         if (p["action"] === "done") {
           process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 종료 — ${p["reason"]}\n`);
+        } else if (p["action"] === "explore_parallel") {
+          const branches = (p["branches"] as Array<Record<string, unknown>>) ?? [];
+          process.stderr.write(`${tag} [${round}라운드] 판단: 병렬 탐색 ${branches.length}개\n`);
+          for (const b of branches) {
+            process.stderr.write(`  → ${b["url"]} (${b["linkId"]})\n`);
+          }
+          if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
         } else {
           process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 계속 → ${p["url"]}\n`);
           process.stderr.write(`  이유: ${p["rationale"]}\n`);

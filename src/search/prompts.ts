@@ -13,6 +13,11 @@ export const MAX_DEPTH = 2;
 // Phase 5에서 CLI 옵션으로 옵션화 예정.
 export const MAX_CHILD_CALLS_PER_AGENT = 3;
 
+// 오케스트레이터가 한 번의 explore_parallel 라운드에서 동시에 실행할 수 있는 최대 explorer 수.
+// Playwright 브라우저가 동시에 여러 개 실행되어 메모리 사용량이 증가하므로 안전장치.
+// Phase 5에서 CLI 옵션 --max-parallel로 옵션화 예정.
+export const MAX_PARALLEL = 3;
+
 // 사용자 질문을 Google 검색에 최적화된 영어 쿼리로 변환.
 // 한국어 질문을 그대로 Google에 넣으면 영어 자료 접근이 제한되므로 사전 변환.
 export function buildSearchQueryPrompt(userQuery: string): LLMMessage[] {
@@ -59,9 +64,10 @@ export function buildNextActionPrompt(
 
 Output format requirement (read first): respond with a single JSON object only. No prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes shown below and nothing else.
 
-You have access to a Google search results page. Based on findings so far, decide:
-1. Explore another page — if current findings are insufficient to answer the question
-2. Stop — if you already have enough information to give a complete, reliable answer
+You have access to a Google search results page. Based on findings so far, choose exactly one of:
+1. Explore one page — when the next page to visit depends on what the current findings tell you, or when only one unvisited candidate is worth dispatching right now
+2. Explore multiple pages in parallel — when 2-${MAX_PARALLEL} unvisited candidates are independently worth exploring AND none of them needs to see another's result before being dispatched
+3. Stop — if you already have enough information to give a complete, reliable answer
 
 Rules:
 - Only explore if it would meaningfully improve the answer
@@ -73,14 +79,37 @@ Rules:
 - Stop only when you have strong confidence in the answer, or when no relevant unvisited SERP candidate is likely to improve completeness or reliability.
 - Do not explore just to be broad; explore only when the page is likely to improve completeness, precision, authority, or verification.
 
+Parallel vs serial — choose by dependency, not by breadth:
+
+Use explore_parallel (must) when 2-${MAX_PARALLEL} branches are independent and ALL are needed. Patterns:
+- Aspect decomposition: distinct facts about one subject live on different canonical pages, and no fact changes how another should be looked up (e.g., a company's headcount, headquarters location, and founding year on three separate official or reference pages).
+- Comparison: the same attribute looked up across multiple subjects, each on its own page (e.g., the spec sheet of two competing products to compare a single field).
+- List completion from complementary sources: each source contributes a disjoint slice of the list you need to assemble.
+
+Use serial explore (must) when later choices depend on earlier results. Patterns:
+- Drill-down: you cannot phrase the next task until you have read the current page (e.g., to find the most-cited work of a recent award winner you must first identify the winner from one page, then look up their citations on another).
+- Conditional fallback: one authoritative page is likely enough; visit secondary candidates only if it does not answer. Saves budget when the first source suffices.
+- Bridge question: the answer of one lookup IS the subject of the next (e.g., "Who founded the company that acquired X?" — the acquirer must be resolved before its founder can be searched).
+
+When dependency is unclear, lean toward the efficient option:
+- All candidates would be visited regardless of each other's results → prefer parallel; it saves wall-clock without changing the outcome.
+- A single page clearly dominates the rest or is likely sufficient → prefer a single explore; do not batch for breadth's sake.
+- Any suspicion that one branch's result would reshape another branch's task → prefer serial; do not run work you may have to discard.
+
+Do NOT use explore_parallel for:
+- Duplicates or paraphrases of the same primary source (the same article in different languages, multiple outlets republishing one wire story, aggregators that repackage a single source). Pick the most authoritative one instead.
+- "Safety" candidates added just in case — only batch what you would have visited anyway under serial.
+
 Respond with JSON only (no markdown code fences):
-Explore: {"action": "explore", "linkId": "L5", "task": "Concise instruction for the sub-agent (what to find)", "rationale": "Why this page is worth exploring"}
-Stop:    {"action": "done", "reason": "Why current findings are sufficient"}
+Explore one:        {"action": "explore", "linkId": "L5", "task": "Concise instruction for the sub-agent (what to find)", "rationale": "Why this page is worth exploring"}
+Explore in parallel:{"action": "explore_parallel", "branches": [{"linkId": "L3", "task": "...", "rationale": "..."}, {"linkId": "L7", "task": "...", "rationale": "..."}], "rationale": "Why these branches are independent"}
+Stop:               {"action": "done", "reason": "Why current findings are sufficient"}
 
 Rules for task vs rationale:
 - task: short imperative instruction stating WHAT the sub-agent should find, treating the chosen URL as ITS starting point (the sub-agent may follow further links from there). E.g. "Faker 페이지를 기점으로 함께한 역대 탑라이너 목록 추출"
 - rationale: brief justification for WHY this URL was selected (for logging only)
-The linkId MUST be one of the IDs (e.g. [L5]) visible in the search results above. Do not invent IDs.`,
+The linkId MUST be one of the IDs (e.g. [L5]) visible in the search results above. Do not invent IDs.
+In explore_parallel, every branch must use a distinct linkId visible above; do not repeat IDs.`,
     },
     {
       role: "user",
