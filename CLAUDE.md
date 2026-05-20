@@ -34,8 +34,9 @@ src/search/
   logger.ts         — 디버그 로거 (시간순 들여쓰기 JSONL, finalize()로 일괄 저장)
   openai-client.ts  — OpenAI SDK 래퍼 (자동 로깅 + JSON 응답 강제 옵션)
   prompts.ts        — 모든 LLM 프롬프트 템플릿 + 하드 리밋 상수
+  search-engines.ts — google/bing/naver SERP URL 빌더 (페이지네이션 포함)
   explorer.ts       — 탐색 에이전트 (runExplorationAgent)
-  orchestrator.ts   — 오케스트레이터 (runSearch)
+  orchestrator.ts   — 오케스트레이터 (runSearch) — 에이전틱 행동 루프
   json-utils.ts     — LLM 응답에서 JSON을 관대하게 파싱 (parseJsonResponse)
   cli.ts            — llm-search CLI 진입점
 ```
@@ -92,15 +93,29 @@ ExplorationReport — 하위 → 상위 에이전트 보고
 
 ## 검색 도구 동작 방식
 
-`runSearch(options)` 흐름:
-1. [LLM] 검색 쿼리 생성 (한국어 → 영어 등 최적화)
-2. `convertPage(googleUrl, { scroll: false, stealth: true })` — SERP 변환
-3. `extractSerpSnippets(markdown, keepLinkIds=true)` — Main Content 스니펫 추출 (링크 ID 유지)
-4. 루프 (라운드 ≤ MAX_PAGES=5 AND 누적 페이지 < MAX_PAGES):
-   - [LLM] 판단: explore(linkId 선택) / explore_parallel(branches[]) / done
-   - explore → `runExplorationAgent(brief)` 실행 → 탐색 에이전트 아젠틱 루프 실행 → 보고 수신
-   - explore_parallel → 최대 MAX_PARALLEL=3개의 독립 브랜치를 `Promise.all`로 동시 실행, 보고 일괄 수집
-5. [LLM] 수집된 보고로 최종 답변 합성
+`runSearch(options)` 흐름 — **오케스트레이터 자체가 에이전틱 루프**다 (Phase 4):
+
+1. `buildOrchestratorInitialPrompt(query)`로 messages 초기화 (system + 첫 user 메시지)
+2. 루프 (최대 `ORCHESTRATOR_MAX_ROUNDS=12`):
+   - [LLM] JSON 한 줄로 행동(action) 결정 — 5종:
+     - `search(engine, query)` — 새 SERP 획득. 엔진: `google` / `naver` / `bing`
+     - `paginate(page)` — 현재 SERP의 다른 페이지로 이동 (engine/query는 유지)
+     - `explore(linkId, task)` — 단일 탐색 에이전트 디스패치
+     - `explore_parallel(branches[])` — 최대 `MAX_PARALLEL=3` 병렬 디스패치
+     - `done(reason)` — 종료
+   - 행동 실행 결과(SERP 스니펫 / 탐색 보고 / 에러 안내)를 messages 끝에 append-only
+   - 무효한 입력은 에러 메시지 주입 후 다음 라운드에서 LLM이 재선택 (크래시 없음)
+3. 종료 후 수집된 보고로 최종 답변 합성. 보고 없으면 마지막 SERP 폴백, SERP도 없으면 "no data".
+
+**하드 리밋** (`prompts.ts`):
+- `ORCHESTRATOR_MAX_ROUNDS=12` — 전체 LLM 판단 횟수
+- `ORCHESTRATOR_MAX_SEARCHES=5` — search + paginate 합계
+- `ORCHESTRATOR_MAX_EXPLORES=5` — explorer 누적 디스패치 (병렬 1배치도 각각 카운트)
+- `MAX_PARALLEL=3` — 한 explore_parallel 배치 내 동시 디스패치 수
+
+**검색 엔진** (`search-engines.ts`):
+- `buildSerpUrl(engine, query, page)` — google/bing/naver의 페이지네이션 파라미터 차이를 흡수
+- 같은 `(engine, query, page)` 삼중쌍 재검색은 자동 차단
 
 **탐색 에이전트 아젠틱 루프** (`runExplorationAgent` 내부):
 - 페이지 변환 후 초기 messages 구성. 페이지는 "출발점"으로 프레이밍되어, 자식 탐색이 일상적 선택지임을 명시.
@@ -116,8 +131,9 @@ ExplorationReport — 하위 → 상위 에이전트 보고
 
 프롬프트는 done의 비가역성도 경고한다 — done 반환 시 해당 페이지와 그로부터 도달 가능한 모든 페이지가 잠긴다(재방문 불가). list/history 형태 질문에서는 `completeness="complete"`를 보수적으로 사용하도록 명시.
 
-**SERP 기반 합성 특이 동작**: 탐색이 없거나 모든 탐색이 `found=false`이면 SERP 스니펫으로 합성.
+**SERP 기반 합성 특이 동작**: 탐색이 없거나 모든 탐색이 `found=false`이면 **마지막** SERP 스니펫으로 합성.
 이 경우 `useSerpSynthesis=true`로 합성 프롬프트에 전달 → URL 인용 금지 (실제 방문 안 함).
+search조차 한 번도 안 했으면 "no data" 보고로 합성 → 모르겠다는 응답이 생성됨.
 
 `extractSerpSnippets()`:
 - 오케스트레이터 판단 루프용: `keepLinkIds=true` — LLM이 linkId로 탐색 대상 선택
@@ -176,5 +192,5 @@ ISO 8601 타임스탬프 문자열 정렬 = 시간순 정렬을 활용해 finali
 | 1 | 완료 | 단일 깊이 직렬 탐색 CLI |
 | 2 | 완료 | 탐색 에이전트 아젠틱 루프 |
 | 3 | 완료 | 오케스트레이터 레벨 병렬 에이전트 호출 (`explore_parallel`) |
-| 4 | 미구현 | 지능적 종료 강화 |
+| 4 | 완료 | 오케스트레이터 자율 행동 루프 — 종료 판단도 LLM 자율 (원안의 "지능적 종료 강화" 흡수) |
 | 5 | 미구현 | CLI 옵션 고도화 |

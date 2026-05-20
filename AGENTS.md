@@ -96,11 +96,18 @@ ExplorationReport — 하위 → 상위 에이전트 보고
 1. [LLM] 검색 쿼리 생성 (한국어 → 영어 등 최적화)
 2. `convertPage(googleUrl, { scroll: false, stealth: true })` — SERP 변환
 3. `extractSerpSnippets(markdown, keepLinkIds=true)` — Main Content 스니펫 추출 (링크 ID 유지)
-4. 루프 (라운드 ≤ MAX_PAGES=5 AND 누적 페이지 < MAX_PAGES):
-   - [LLM] 판단: explore(linkId 선택) / explore_parallel(branches[]) / done
-   - explore → `runExplorationAgent(brief)` 실행 → 탐색 에이전트 아젠틱 루프 실행 → 보고 수신
-   - explore_parallel → 최대 MAX_PARALLEL=3개의 독립 브랜치를 `Promise.all`로 동시 실행, 보고 일괄 수집
-5. [LLM] 수집된 보고로 최종 답변 합성
+오케스트레이터는 에이전틱 행동 루프 (Phase 4)다.
+
+1. `buildOrchestratorInitialPrompt(query)`로 messages 초기화 (system + 첫 user)
+2. 루프 (≤ ORCHESTRATOR_MAX_ROUNDS=12):
+   - [LLM] 행동 5종 중 하나 결정:
+     - `search(engine, query)` — engine: google/naver/bing
+     - `paginate(page)` — 현재 SERP의 다른 페이지
+     - `explore(linkId, task)` — 단일 디스패치
+     - `explore_parallel(branches[])` — 최대 MAX_PARALLEL=3 병렬
+     - `done(reason)` — 종료
+   - 행동 결과를 messages 끝에 append-only (prefix cache 유지)
+3. 보고 수집 후 최종 답변 합성. 보고 없으면 마지막 SERP로 폴백.
 
 **탐색 에이전트 아젠틱 루프** (`runExplorationAgent` 내부):
 - 페이지 변환 후 초기 messages 구성. 페이지는 "출발점"으로 프레이밍되어, 자식 탐색이 일상적 선택지임을 명시.
@@ -176,5 +183,5 @@ ISO 8601 타임스탬프 문자열 정렬 = 시간순 정렬을 활용해 finali
 | 1 | 완료 | 단일 깊이 직렬 탐색 CLI |
 | 2 | 완료 | 탐색 에이전트 아젠틱 루프 |
 | 3 | 완료 | 오케스트레이터 레벨 병렬 에이전트 호출 (`explore_parallel`) |
-| 4 | 미구현 | 지능적 종료 강화 |
+| 4 | 완료 | 오케스트레이터 자율 행동 루프 (search/paginate/explore/explore_parallel/done) — 다중 엔진, 재검색, 페이지네이션. 종료 판단도 LLM 자율 (Phase 4 원안의 "지능적 종료 강화" 흡수) |
 | 5 | 미구현 | CLI 옵션 고도화 |

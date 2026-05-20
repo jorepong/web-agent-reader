@@ -226,17 +226,36 @@ SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LL
 
 ---
 
-## 7. Phase 4: 지능적 종료 강화
+## 7. Phase 4: 오케스트레이터 자율 행동 루프 (완료)
 
-**현재 상태**: 오케스트레이터 레벨에서 매 라운드 판단 (이미 구현됨). 다만 판단 기준이 단순함.
+**목표**: 오케스트레이터를 "SERP 1회 → 링크 루프"의 고정 구조에서 벗어나, 행동(action) 집합 위에서 도는 에이전틱 루프로 전환. 검색 엔진/쿼리/페이지/탐색 대상 모두 LLM이 자율 판단. 원안의 "지능적 종료 강화"는 이 루프 안에 자연스럽게 흡수됨 — LLM이 종료 시점을 휴리스틱(정보 충분/반복 실패/관련성 하락)으로 결정.
 
-**목표**: 더 정교한 종료 판단. 탐색이 더 이상 가치 없음을 조기에 감지.
+**핵심 설계**:
+- 행동 5종: `search(engine, query)` / `paginate(page)` / `explore(linkId, task)` / `explore_parallel(branches[])` / `done(reason)`
+- 매 라운드 LLM이 행동 1개 결정 → 시스템 실행 → 결과를 messages 끝에 append-only
+- 무효한 입력(JSON 파싱 실패, 무효 linkId, 한도 초과, 중복 검색)은 에러 메시지 주입 후 다음 라운드에서 재선택
+- append-only 원칙으로 OpenAI prefix cache 히트율 유지 → 많은 행동을 해도 라운드당 토큰 비용 작음
 
-**구현 항목**:
-- [ ] 탐색 이력에서 패턴 감지: 연속 N번 `found=false`이면 종료
-- [ ] 유사도 기반 중복 감지: 이미 수집한 정보와 중복되는 내용만 계속 나오면 종료
-- [ ] 목표 달성 신뢰도 점수: ExplorationReport에 `confidence` 필드 추가, 임계값 초과 시 조기 종료
-- [ ] `ExplorationReport`에 `stopReason` 필드 추가 (why stopped: 정보충분/중복/관련없음/깊이초과)
+**현재 구현 상태 (완료)**:
+- [x] `src/search/search-engines.ts` — google/bing/naver SERP URL 빌더 (페이지네이션 포함)
+- [x] `buildOrchestratorInitialPrompt` 등 새 프롬프트 함수 (`prompts.ts`) — 기존 `buildSearchQueryPrompt`, `buildNextActionPrompt` 제거
+- [x] `orchestrator.ts` 에이전틱 루프로 전면 재작성
+- [x] 하드 리밋:
+  - `ORCHESTRATOR_MAX_ROUNDS = 12` — 전체 라운드 상한
+  - `ORCHESTRATOR_MAX_SEARCHES = 5` — search + paginate 합계
+  - `ORCHESTRATOR_MAX_EXPLORES = 5` — explorer 누적 디스패치 (병렬 1배치 = 각각 카운트)
+  - `MAX_PARALLEL = 3` — 한 explore_parallel 배치 내 동시 디스패치
+- [x] 같은 (engine, query, page) 삼중쌍 재검색 차단
+- [x] SERP 변환 실패 시도 history에 기록 (같은 실패 쿼리 무한 재시도 방지)
+- [x] 합성 폴백 분기 확장: explorer 보고 없음 → 마지막 SERP / SERP도 없음 → "no data" 보고
+- [x] logger stderr 출력에 search/paginate/explore/explore_parallel/error 분기 추가
+- [x] 시나리오 테스트 추가 (search→explore, 엔진 전환 재검색, paginate, parallel, SERP 없이 explore 시 에러 주입 복구)
+
+**남은 검토 항목 (별도 작업)**:
+- [ ] 탐색 에이전트(explorer) 내부 자식 호출 병렬화 — 현재는 직렬, append-only 캐시 키 안정화 설계 필요
+- [ ] DuckDuckGo / 도메인 특화 소스(arXiv, Stack Overflow, github) 추가
+- [ ] 검색 결과 캐싱 — 동일 (engine, query, page)의 SERP를 세션 간 재사용
+- [ ] 토큰 사용량 집계 — 현재 explorer 보고에는 있지만 오케스트레이터 라운드별 누적은 미집계
 
 ---
 
