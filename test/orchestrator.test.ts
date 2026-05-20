@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertPage } from "../src/index.js";
 import { runExplorationAgent } from "../src/search/explorer.js";
 import { runSearch } from "../src/search/orchestrator.js";
-import { buildNextActionPrompt } from "../src/search/prompts.js";
+import { buildOrchestratorInitialPrompt } from "../src/search/prompts.js";
 import type { ConvertResult } from "../src/types.js";
 import type { ExplorationReport, LLMMessage, TokenUsage } from "../src/search/types.js";
 
@@ -19,319 +19,340 @@ const tokenUsage: TokenUsage = { promptTokens: 1, completionTokens: 1, totalToke
 function report(overrides: Partial<ExplorationReport>): ExplorationReport {
   return {
     agentId: "explorer-1",
-    url: "https://lol.fandom.com/wiki/Faker",
+    url: "https://example.com/page",
     found: true,
     completeness: "partial",
-    summary: "Impact, MaRin, Huni, Khan, and Doran were found, but the list is not complete.",
+    summary: "Some relevant content found, but the answer is incomplete.",
     relevantExcerpts: [],
-    missingInfo: ["Full historical roster coverage is missing."],
+    missingInfo: ["Some details are missing."],
     tokenUsage,
     ...overrides,
   };
 }
 
-function serpResult(): ConvertResult {
-  const sourceUrl = "https://www.google.com/search?q=faker";
+// 임의의 (engine, query, page) 조합에 대해 SERP 형태의 ConvertResult를 생성한다.
+// links는 호출 측이 직접 주입한다(테스트마다 다른 링크가 필요).
+function makeSerp(opts: {
+  url: string;
+  links: ConvertResult["links"]["links"];
+  body?: string;
+}): ConvertResult {
+  const linkIds = Object.keys(opts.links);
+  const lines = ["# SERP", "", "## Main Content", ""];
+  for (const id of linkIds) {
+    lines.push(`${opts.links[id]!.text} [${id}]`);
+  }
+  if (opts.body) lines.push("", opts.body);
+
   return {
-    markdown: [
-      "# Google",
-      "",
-      "## Main Content",
-      "",
-      "Faker - Leaguepedia [L1]",
-      "T1 - Leaguepedia [L2]",
-      "SKT T1 history - Wikipedia [L3]",
-    ].join("\n"),
+    markdown: lines.join("\n"),
     links: {
       pageId: "SERP",
-      sourceUrl,
-      links: {
-        L1: {
-          id: "L1",
-          text: "Faker",
-          url: "https://lol.fandom.com/wiki/Faker",
-          kind: "external",
-          sourcePath: "a",
-        },
-        L2: {
-          id: "L2",
-          text: "T1",
-          url: "https://lol.fandom.com/wiki/T1",
-          kind: "external",
-          sourcePath: "a",
-        },
-        L3: {
-          id: "L3",
-          text: "SKT T1 history",
-          url: "https://en.wikipedia.org/wiki/T1_(esports)",
-          kind: "external",
-          sourcePath: "a",
-        },
-      },
+      sourceUrl: opts.url,
+      links: opts.links,
     },
     page: {
       pageId: "SERP",
-      title: "Google",
-      urlHost: "www.google.com",
-      sourceUrl,
-      generatedAt: "2026-05-19T00:00:00.000Z",
+      title: "SERP",
+      urlHost: new URL(opts.url).host,
+      sourceUrl: opts.url,
+      generatedAt: "2026-05-21T00:00:00.000Z",
       blocks: [],
-      stats: { linkCount: 3, elementCount: 0, blockCount: 0 },
+      stats: { linkCount: linkIds.length, elementCount: 0, blockCount: 0 },
     },
     elements: {
       pageId: "SERP",
-      sourceUrl,
+      sourceUrl: opts.url,
       elements: {},
     },
   };
 }
 
-describe("runSearch", () => {
+// LLM action 응답을 손쉽게 만드는 헬퍼.
+function actionResponse(payload: unknown) {
+  return { text: JSON.stringify(payload), tokenUsage };
+}
+
+describe("runSearch (agentic orchestrator)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("can explore another SERP result after a partial report when the orchestrator chooses it", async () => {
-    vi.mocked(convertPage).mockResolvedValue(serpResult());
+  it("issues a search action then dispatches an explorer on the resulting SERP", async () => {
+    const googleSerp = makeSerp({
+      url: "https://www.google.com/search?q=...",
+      links: {
+        L1: {
+          id: "L1",
+          text: "Authoritative page",
+          url: "https://example.com/authoritative",
+          kind: "external",
+          sourcePath: "a",
+        },
+      },
+    });
+    vi.mocked(convertPage).mockResolvedValue(googleSerp);
+    vi.mocked(runExplorationAgent).mockResolvedValue(
+      report({ agentId: "explorer-2", url: "https://example.com/authoritative", completeness: "complete", missingInfo: [] }),
+    );
 
-    vi.mocked(runExplorationAgent)
-      .mockResolvedValueOnce(report({}))
-      .mockResolvedValueOnce(report({
-        agentId: "explorer-2",
-        url: "https://lol.fandom.com/wiki/T1",
-        completeness: "complete",
-        summary: "Complete roster-derived top-laner list found.",
-        missingInfo: [],
-      }));
-
+    // 라운드 호출 순서대로 응답을 반환하는 mock
+    const responses: unknown[] = [
+      { action: "search", engine: "google", query: "test query", rationale: "default engine" },
+      { action: "explore", linkId: "L1", task: "Extract authoritative content", rationale: "Looks canonical" },
+      { action: "done", reason: "Sufficient" },
+    ];
+    let i = 0;
     const client = {
-      complete: vi.fn(async (_agentId: string, messages: LLMMessage[]) => {
-        if (messages[0]?.content.includes("search query specialist")) {
-          return { text: "Faker teammates top laners history", tokenUsage };
+      complete: vi.fn(async (_id: string, messages: LLMMessage[]) => {
+        const first = messages[0]?.content ?? "";
+        if (first.startsWith("You are a research synthesizer")) {
+          return { text: "final answer", tokenUsage };
         }
-        if (messages[0]?.content.includes("research agent deciding")) {
-          const content = messages[1]?.content ?? "";
-          if (content.includes("Already explored (0/5)")) {
-            return {
-              text: JSON.stringify({
-                action: "explore",
-                linkId: "L1",
-                task: "Extract Faker top-lane teammates",
-                rationale: "Faker page is the best starting point.",
-              }),
-              tokenUsage,
-            };
-          }
-          if (content.includes("Already explored (1/5)")) {
-            return {
-              text: JSON.stringify({
-                action: "explore",
-                linkId: "L2",
-                task: "Extract T1 historical top-lane roster entries overlapping Faker",
-                rationale: "T1 page is a structured team roster source.",
-              }),
-              tokenUsage,
-            };
-          }
-          return {
-            text: JSON.stringify({
-              action: "done",
-              reason: "The structured team page completed the answer.",
-            }),
-            tokenUsage,
-          };
-        }
-        return { text: "final answer", tokenUsage };
+        const next = responses[i++];
+        return actionResponse(next);
       }),
     };
-    const logger = {
-      startAgent: vi.fn(),
-      log: vi.fn(async () => undefined),
-    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
 
-    await runSearch(
-      { query: "페이커와 함께한 역대 탑라이너", model: "test", debug: false, logDir: "." },
+    const answer = await runSearch(
+      { query: "테스트 질문", model: "test", debug: false, logDir: "." },
       client as never,
       logger as never,
     );
 
-    expect(runExplorationAgent).toHaveBeenCalledTimes(2);
+    expect(answer).toBe("final answer");
+    // convertPage는 SERP 1회만 호출 (explorer가 mock이라 페이지 변환 추가 호출 없음)
+    expect(convertPage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(convertPage).mock.calls[0][0]).toContain("google.com/search");
+    expect(runExplorationAgent).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runExplorationAgent).mock.calls[0][0]).toMatchObject({
-      url: "https://lol.fandom.com/wiki/Faker",
-    });
-    expect(vi.mocked(runExplorationAgent).mock.calls[1][0]).toMatchObject({
-      goal: "Extract T1 historical top-lane roster entries overlapping Faker",
-      url: "https://lol.fandom.com/wiki/T1",
+      url: "https://example.com/authoritative",
+      goal: "Extract authoritative content",
     });
   });
 
-  it("dispatches multiple explorers concurrently when the orchestrator chooses explore_parallel", async () => {
-    vi.mocked(convertPage).mockResolvedValue(serpResult());
-
-    // 동시 실행 여부를 검증하기 위해 호출 시작/종료 시점을 추적한다.
-    let activeCalls = 0;
-    let maxActiveCalls = 0;
-    let releaseExplorers!: () => void;
-    const explorersStarted = new Promise<void>((resolve) => {
-      releaseExplorers = resolve;
+  it("can re-search on a different engine after an unsatisfying SERP", async () => {
+    const googleSerp = makeSerp({
+      url: "https://www.google.com/search?q=...",
+      links: {
+        L1: { id: "L1", text: "Blog spam", url: "https://spam.example.com/a", kind: "external", sourcePath: "a" },
+      },
     });
-
-    vi.mocked(runExplorationAgent).mockImplementation(async (brief) => {
-      activeCalls++;
-      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
-      // 모든 explorer가 시작되기 전까지 첫 explorer가 완료되지 않도록 막아 동시성을 강제한다.
-      if (activeCalls >= 2) releaseExplorers();
-      await explorersStarted;
-      activeCalls--;
-      return report({
-        agentId: brief.agentId,
-        url: brief.url,
-      });
+    const naverSerp = makeSerp({
+      url: "https://search.naver.com/search.naver?query=...",
+      links: {
+        L1: { id: "L1", text: "공식 문서", url: "https://official.example.kr/", kind: "external", sourcePath: "a" },
+      },
     });
+    vi.mocked(convertPage).mockResolvedValueOnce(googleSerp).mockResolvedValueOnce(naverSerp);
+    vi.mocked(runExplorationAgent).mockResolvedValue(
+      report({ url: "https://official.example.kr/", completeness: "complete", missingInfo: [] }),
+    );
 
+    const responses: unknown[] = [
+      { action: "search", engine: "google", query: "한국 통계", rationale: "global default" },
+      // SERP가 스팸이라 판단 → 네이버로 재검색
+      { action: "search", engine: "naver", query: "한국 공식 통계 보고서", rationale: "Korean topic" },
+      { action: "explore", linkId: "L1", task: "공식 보고서에서 통계 추출", rationale: "official source" },
+      { action: "done", reason: "got the official figure" },
+    ];
+    let i = 0;
     const client = {
-      complete: vi.fn(async (_agentId: string, messages: LLMMessage[]) => {
-        if (messages[0]?.content.includes("search query specialist")) {
-          return { text: "Faker teammates top laners history", tokenUsage };
+      complete: vi.fn(async (_id: string, messages: LLMMessage[]) => {
+        if (messages[0]?.content.startsWith("You are a research synthesizer")) {
+          return { text: "final answer", tokenUsage };
         }
-        if (messages[0]?.content.includes("research agent deciding")) {
-          const content = messages[1]?.content ?? "";
-          if (content.includes("Already explored (0/5)")) {
-            return {
-              text: JSON.stringify({
-                action: "explore_parallel",
-                branches: [
-                  { linkId: "L1", task: "Faker page details", rationale: "Player profile" },
-                  { linkId: "L2", task: "T1 roster history", rationale: "Team page" },
-                  { linkId: "L3", task: "Wikipedia history", rationale: "Independent overview" },
-                ],
-                rationale: "These pages are independent.",
-              }),
-              tokenUsage,
-            };
-          }
-          return {
-            text: JSON.stringify({
-              action: "done",
-              reason: "Parallel batch produced enough information.",
-            }),
-            tokenUsage,
-          };
-        }
-        return { text: "final answer", tokenUsage };
+        return actionResponse(responses[i++]);
       }),
     };
-    const logger = {
-      startAgent: vi.fn(),
-      log: vi.fn(async () => undefined),
-    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
 
     await runSearch(
-      { query: "페이커와 함께한 역대 탑라이너", model: "test", debug: false, logDir: "." },
+      { query: "한국 통계", model: "test", debug: false, logDir: "." },
+      client as never,
+      logger as never,
+    );
+
+    expect(convertPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(convertPage).mock.calls[0][0]).toContain("google.com/search");
+    expect(vi.mocked(convertPage).mock.calls[1][0]).toContain("search.naver.com");
+    expect(runExplorationAgent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runExplorationAgent).mock.calls[0][0]).toMatchObject({
+      url: "https://official.example.kr/",
+    });
+  });
+
+  it("paginates within the same SERP when LLM chooses paginate", async () => {
+    const page1 = makeSerp({
+      url: "https://www.google.com/search?q=...",
+      links: {
+        L1: { id: "L1", text: "Result 1", url: "https://example.com/p1", kind: "external", sourcePath: "a" },
+      },
+    });
+    const page2 = makeSerp({
+      url: "https://www.google.com/search?q=...&start=10",
+      links: {
+        L1: { id: "L1", text: "Result 11", url: "https://example.com/p11", kind: "external", sourcePath: "a" },
+      },
+    });
+    vi.mocked(convertPage).mockResolvedValueOnce(page1).mockResolvedValueOnce(page2);
+    vi.mocked(runExplorationAgent).mockResolvedValue(
+      report({ url: "https://example.com/p11", completeness: "complete", missingInfo: [] }),
+    );
+
+    const responses: unknown[] = [
+      { action: "search", engine: "google", query: "rare topic", rationale: "default" },
+      { action: "paginate", page: 2, rationale: "first page lacked the right candidate" },
+      { action: "explore", linkId: "L1", task: "deep dive", rationale: "promising" },
+      { action: "done", reason: "done" },
+    ];
+    let i = 0;
+    const client = {
+      complete: vi.fn(async (_id: string, messages: LLMMessage[]) => {
+        if (messages[0]?.content.startsWith("You are a research synthesizer")) {
+          return { text: "final answer", tokenUsage };
+        }
+        return actionResponse(responses[i++]);
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+
+    await runSearch(
+      { query: "rare topic", model: "test", debug: false, logDir: "." },
+      client as never,
+      logger as never,
+    );
+
+    expect(convertPage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(convertPage).mock.calls[1][0]).toContain("start=10");
+    expect(runExplorationAgent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runExplorationAgent).mock.calls[0][0]).toMatchObject({
+      url: "https://example.com/p11",
+    });
+  });
+
+  it("dispatches multiple explorers concurrently when LLM picks explore_parallel", async () => {
+    const serp = makeSerp({
+      url: "https://www.google.com/search?q=...",
+      links: {
+        L1: { id: "L1", text: "A", url: "https://example.com/a", kind: "external", sourcePath: "a" },
+        L2: { id: "L2", text: "B", url: "https://example.com/b", kind: "external", sourcePath: "a" },
+        L3: { id: "L3", text: "C", url: "https://example.com/c", kind: "external", sourcePath: "a" },
+      },
+    });
+    vi.mocked(convertPage).mockResolvedValue(serp);
+
+    let active = 0;
+    let maxActive = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    vi.mocked(runExplorationAgent).mockImplementation(async (brief) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      if (active >= 3) release();
+      await gate;
+      active--;
+      return report({ agentId: brief.agentId, url: brief.url });
+    });
+
+    const responses: unknown[] = [
+      { action: "search", engine: "google", query: "x", rationale: "go" },
+      {
+        action: "explore_parallel",
+        branches: [
+          { linkId: "L1", task: "t1", rationale: "r1" },
+          { linkId: "L2", task: "t2", rationale: "r2" },
+          { linkId: "L3", task: "t3", rationale: "r3" },
+        ],
+        rationale: "independent",
+      },
+      { action: "done", reason: "ok" },
+    ];
+    let i = 0;
+    const client = {
+      complete: vi.fn(async (_id: string, messages: LLMMessage[]) => {
+        if (messages[0]?.content.startsWith("You are a research synthesizer")) {
+          return { text: "final answer", tokenUsage };
+        }
+        return actionResponse(responses[i++]);
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+
+    await runSearch(
+      { query: "x", model: "test", debug: false, logDir: "." },
       client as never,
       logger as never,
     );
 
     expect(runExplorationAgent).toHaveBeenCalledTimes(3);
-    // 셋이 동시에 진행됐는지 검증 (직렬 실행이었다면 maxActiveCalls=1).
-    expect(maxActiveCalls).toBe(3);
-    const briefs = vi.mocked(runExplorationAgent).mock.calls.map((c) => c[0]);
-    expect(briefs.map((b) => b.url).sort()).toEqual([
-      "https://en.wikipedia.org/wiki/T1_(esports)",
-      "https://lol.fandom.com/wiki/Faker",
-      "https://lol.fandom.com/wiki/T1",
-    ]);
-    expect(briefs.every((b) => b.parentAgentId === "orchestrator")).toBe(true);
-    expect(briefs.every((b) => b.depth === 0)).toBe(true);
+    expect(maxActive).toBe(3);
   });
 
-  it("falls through to the next round when explore_parallel branches are all invalid", async () => {
-    vi.mocked(convertPage).mockResolvedValue(serpResult());
+  it("injects an error message and retries when the LLM picks explore before any search", async () => {
+    const serp = makeSerp({
+      url: "https://www.google.com/search?q=...",
+      links: {
+        L1: { id: "L1", text: "A", url: "https://example.com/a", kind: "external", sourcePath: "a" },
+      },
+    });
+    vi.mocked(convertPage).mockResolvedValue(serp);
+    vi.mocked(runExplorationAgent).mockResolvedValue(report({ url: "https://example.com/a" }));
 
-    vi.mocked(runExplorationAgent).mockResolvedValue(
-      report({
-        agentId: "explorer-2",
-        url: "https://lol.fandom.com/wiki/Faker",
-        completeness: "complete",
-        missingInfo: [],
-      }),
-    );
-
-    let callIndex = 0;
+    const responses: unknown[] = [
+      // 첫 라운드에서 SERP 없이 explore — 에러 메시지 주입 후 다음 라운드로
+      { action: "explore", linkId: "L1", task: "premature", rationale: "wrong" },
+      { action: "search", engine: "google", query: "x", rationale: "recover" },
+      { action: "explore", linkId: "L1", task: "good", rationale: "now valid" },
+      { action: "done", reason: "done" },
+    ];
+    let i = 0;
     const client = {
-      complete: vi.fn(async (_agentId: string, messages: LLMMessage[]) => {
-        if (messages[0]?.content.includes("search query specialist")) {
-          return { text: "Faker", tokenUsage };
+      complete: vi.fn(async (_id: string, messages: LLMMessage[]) => {
+        if (messages[0]?.content.startsWith("You are a research synthesizer")) {
+          return { text: "final answer", tokenUsage };
         }
-        if (messages[0]?.content.includes("research agent deciding")) {
-          callIndex++;
-          if (callIndex === 1) {
-            return {
-              text: JSON.stringify({
-                action: "explore_parallel",
-                branches: [
-                  { linkId: "L99", task: "bogus", rationale: "invalid" },
-                  { linkId: "L98", task: "bogus", rationale: "invalid" },
-                ],
-                rationale: "Independent.",
-              }),
-              tokenUsage,
-            };
-          }
-          if (callIndex === 2) {
-            return {
-              text: JSON.stringify({
-                action: "explore",
-                linkId: "L1",
-                task: "Fall back to Faker",
-                rationale: "Recover from bad batch",
-              }),
-              tokenUsage,
-            };
-          }
-          return {
-            text: JSON.stringify({ action: "done", reason: "done" }),
-            tokenUsage,
-          };
-        }
-        return { text: "final answer", tokenUsage };
+        return actionResponse(responses[i++]);
       }),
     };
-    const logger = {
-      startAgent: vi.fn(),
-      log: vi.fn(async () => undefined),
-    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
 
     await runSearch(
-      { query: "Faker", model: "test", debug: false, logDir: "." },
+      { query: "x", model: "test", debug: false, logDir: "." },
       client as never,
       logger as never,
     );
 
-    // 1라운드의 모든 branch가 무효 → explorer 호출 없음. 2라운드의 단일 explore는 진행됨.
+    // explore는 두 번째 시도(SERP 확보 이후)에 한 번만 성공
     expect(runExplorationAgent).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runExplorationAgent).mock.calls[0][0]).toMatchObject({
-      url: "https://lol.fandom.com/wiki/Faker",
+      url: "https://example.com/a",
+      goal: "good",
     });
+    // 4라운드의 응답이 messages에 모두 append되었는지 — assistant 메시지 4개
+    const lastCallMessages = client.complete.mock.calls
+      .filter((c) => !(c[1] as LLMMessage[])[0].content.startsWith("You are a research synthesizer"))
+      .at(-1)![1] as LLMMessage[];
+    const assistantCount = lastCallMessages.filter((m) => m.role === "assistant").length;
+    expect(assistantCount).toBeGreaterThanOrEqual(3);
   });
 });
 
-describe("buildNextActionPrompt", () => {
-  it("instructs the orchestrator to keep exploring clearer or more authoritative SERP candidates", () => {
-    const messages = buildNextActionPrompt(
-      "페이커와 함께한 역대 탑라이너",
-      "Faker - Leaguepedia [L1]\nT1 - Leaguepedia [L2]",
-      [report({
-        completeness: "complete",
-        summary: "A complete-looking answer was found.",
-        missingInfo: [],
-      })],
-      ["https://lol.fandom.com/wiki/Faker"],
-      5,
-    );
+describe("buildOrchestratorInitialPrompt", () => {
+  it("describes all five actions and the supported engines", () => {
+    const messages = buildOrchestratorInitialPrompt("a sample question");
+    const sys = messages[0]!.content;
 
-    expect(messages[0]?.content).toContain("Even if current findings appear to answer the question");
-    expect(messages[0]?.content).toContain("clearer, more structured, more authoritative, or better for verification");
-    expect(messages[0]?.content).toContain("strong confidence");
+    for (const action of ["search", "paginate", "explore", "explore_parallel", "done"]) {
+      expect(sys).toContain(action);
+    }
+    for (const engine of ["google", "bing", "naver"]) {
+      expect(sys).toContain(engine);
+    }
+    expect(sys).toContain("agentic loop");
+    expect(messages[1]?.content).toContain("a sample question");
   });
 });
