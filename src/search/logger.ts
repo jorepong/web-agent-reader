@@ -135,18 +135,29 @@ export class DebugLogger {
       }
       case "orchestrator_plan": {
         const round = p["round"] as number;
-        if (p["action"] === "done") {
+        const action = p["action"];
+        if (action === "done") {
           process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 종료 — ${p["reason"]}\n`);
-        } else if (p["action"] === "explore_parallel") {
+        } else if (action === "search") {
+          process.stderr.write(`${tag} [${round}라운드] 판단: 검색 → ${p["engine"]}: "${p["query"]}" (page ${p["page"]})\n`);
+          if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
+        } else if (action === "paginate") {
+          process.stderr.write(`${tag} [${round}라운드] 판단: 페이지 이동 → ${p["engine"]}: "${p["query"]}" (page ${p["page"]})\n`);
+          if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
+        } else if (action === "explore_parallel") {
           const branches = (p["branches"] as Array<Record<string, unknown>>) ?? [];
           process.stderr.write(`${tag} [${round}라운드] 판단: 병렬 탐색 ${branches.length}개\n`);
           for (const b of branches) {
             process.stderr.write(`  → ${b["url"]} (${b["linkId"]})\n`);
           }
           if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
+        } else if (action === "explore") {
+          process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 → ${p["url"]} (${p["linkId"]})\n`);
+          if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
+        } else if (action === "error") {
+          process.stderr.write(`${tag} [${round}라운드] 판단 오류 — ${p["reason"]}\n`);
         } else {
-          process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 계속 → ${p["url"]}\n`);
-          process.stderr.write(`  이유: ${p["rationale"]}\n`);
+          process.stderr.write(`${tag} [${round}라운드] 판단: ${String(action)} (${String(p["reason"] ?? "")})\n`);
         }
         break;
       }

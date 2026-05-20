@@ -1,21 +1,48 @@
-// 검색 오케스트레이터. 전체 탐색 흐름을 조율한다.
-// 흐름: 검색 쿼리 생성 → SERP 변환 → 아젠틱 탐색 루프 → 최종 합성
+// 검색 오케스트레이터. 행동(action) 집합 위에서 도는 에이전틱 루프.
+//
+// 흐름:
+//   1. 시스템 + 사용자 질문으로 messages 초기화
+//   2. 루프 (최대 ORCHESTRATOR_MAX_ROUNDS):
+//        [LLM] 한 행동을 JSON으로 출력
+//          - search(engine, query)          → 새 SERP 획득
+//          - paginate(page)                 → 현재 SERP를 다른 페이지로 이동
+//          - explore(linkId, task)          → 단일 탐색 에이전트 디스패치
+//          - explore_parallel(branches[])   → 병렬 탐색 디스패치 (Promise.all)
+//          - done(reason)                   → 종료
+//        실행 결과를 messages 끝에 append (재구성 금지 — OpenAI prefix cache 히트 유지)
+//   3. 수집된 ExplorationReport로 최종 답변 합성. 보고가 없으면 마지막 SERP로 폴백.
+//
+// 설계 원칙:
+//   - 검색 엔진/쿼리/페이지/탐색 대상 모두 LLM이 자율 판단.
+//   - 잘못된 입력(무효 linkId, 한도 초과, 중복 검색)은 크래시 없이 에러 메시지 주입 → LLM이 재선택.
+//   - 하드 리밋은 안전망: ORCHESTRATOR_MAX_ROUNDS / _MAX_SEARCHES / _MAX_EXPLORES.
 import { convertPage } from "../index.js";
 import { runExplorationAgent } from "./explorer.js";
 import { parseJsonResponse } from "./json-utils.js";
 import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
-import { buildNextActionPrompt, buildSearchQueryPrompt, buildSynthesisPrompt, MAX_PARALLEL } from "./prompts.js";
-import type { ExplorationReport, MissionBrief, SearchOptions } from "./types.js";
-
-// 오케스트레이터 레벨에서 탐색할 수 있는 최대 페이지 수 (비용 폭발 방지 안전장치).
-// 탐색 에이전트 내부의 재귀 깊이 제한(MAX_DEPTH)과는 별개.
-const MAX_PAGES = 5;
-
+import {
+  buildExploreResultMessage,
+  buildOrchestratorErrorMessage,
+  buildOrchestratorInitialPrompt,
+  buildParallelExploreResultMessage,
+  buildSerpResultMessage,
+  buildSynthesisPrompt,
+  MAX_PARALLEL,
+  ORCHESTRATOR_MAX_EXPLORES,
+  ORCHESTRATOR_MAX_ROUNDS,
+  ORCHESTRATOR_MAX_SEARCHES,
+} from "./prompts.js";
+import { buildSerpUrl, isSupportedEngine, type SearchEngine } from "./search-engines.js";
+import type { ConvertResult } from "../types.js";
+import type { ExplorationReport, LLMMessage, MissionBrief, SearchOptions } from "./types.js";
 
 // SERP 마크다운에서 Main Content 섹션만 추출하고 노이즈를 제거한다.
 // keepLinkIds=true: 오케스트레이터 판단 루프용 — LLM이 linkId를 골라야 하므로 ID 유지.
 // keepLinkIds=false: 합성용 — 실제 방문하지 않은 URL 인용 방지를 위해 ID 제거.
+//
+// 현재 skip 필터는 google SERP 어휘에 맞춰져 있지만, 다른 엔진에서는 단순히 매칭이
+// 일어나지 않을 뿐 동작에 문제는 없다. ## Main Content 섹션이 없으면 전체 마크다운을 사용.
 function extractSerpSnippets(markdown: string, keepLinkIds = false): string {
   const mainMatch = markdown.match(/## Main Content\n([\s\S]*?)(?=\n## |$)/);
   const main = mainMatch ? mainMatch[1] : markdown;
@@ -36,54 +63,51 @@ function extractSerpSnippets(markdown: string, keepLinkIds = false): string {
     .trim();
 }
 
+interface CurrentSerp {
+  engine: SearchEngine;
+  query: string;
+  page: number;
+  url: string;
+  result: ConvertResult;
+}
+
+interface ParsedAction {
+  action?: string;
+  engine?: string;
+  query?: string;
+  page?: number;
+  linkId?: string;
+  task?: string;
+  rationale?: string;
+  reason?: string;
+  branches?: Array<{ linkId?: string; task?: string; rationale?: string }>;
+}
+
 export async function runSearch(options: SearchOptions, client: OpenAIClient, logger: DebugLogger): Promise<string> {
   logger.startAgent("orchestrator", null);
 
-  // Step 1: 사용자 질문을 Google 검색에 최적화된 영어 쿼리로 변환
-  const { text: searchQuery } = await client.complete("orchestrator", buildSearchQueryPrompt(options.query));
-  const trimmedQuery = searchQuery.trim();
+  // append-only messages: 시스템 + 첫 user 메시지 이후 (assistant + user) 페어가 라운드마다 추가됨.
+  const messages: LLMMessage[] = buildOrchestratorInitialPrompt(options.query);
 
-  // Step 2: Google SERP 변환
-  // scroll=false: SERP는 초기 로딩에 모든 결과가 포함되어 스크롤 불필요
-  // stealth=true: Google이 headless Chromium을 차단하므로 실제 Chrome 채널 사용
-  const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(trimmedQuery)}&hl=en&gl=us`;
-  const serpResult = await convertPage(googleUrl, { scroll: false, stealth: true, pageId: "SERP" });
-
-  await logger.log("page_markdown", "orchestrator", {
-    url: googleUrl,
-    markdown: serpResult.markdown,
-    pageId: "SERP",
-  });
-
-  // Step 3: 아젠틱 탐색 루프
-  // serpSnippets에 링크 ID를 유지 — 오케스트레이터가 linkId로 탐색 대상 선택하기 때문
-  const serpSnippets = extractSerpSnippets(serpResult.markdown, true);
   const reports: ExplorationReport[] = [];
-  // exploredUrls: 오케스트레이터 레벨 중복 방지 (explorer 내부 visitedUrls와 별개)
   const exploredUrls: string[] = [];
+  // 같은 (engine, query, page) 삼중쌍의 중복 검색 방지
+  const searchHistory: Array<{ engine: SearchEngine; query: string; page: number }> = [];
 
-  // 루프 상한 두 개를 동시에 적용:
-  //   - round <= MAX_PAGES: LLM 판단 횟수 상한 (잘못된 action이 반복돼 무한 루프되는 것 방지)
-  //   - exploredUrls.length < MAX_PAGES: 실제 페이지 수 상한 (병렬 라운드가 단일 라운드보다 빨리 소진)
-  for (let round = 1; round <= MAX_PAGES && exploredUrls.length < MAX_PAGES; round++) {
-    const { text: actionJson } = await client.complete(
-      "orchestrator",
-      buildNextActionPrompt(options.query, serpSnippets, reports, exploredUrls, MAX_PAGES),
-      { jsonResponse: true }
-    );
+  let currentSerp: CurrentSerp | null = null;
+  let searchCount = 0;
+  let exploreCount = 0;
 
-    // 관대한 JSON 파서: 코드펜스/주변 prose가 섞여도 첫 번째 JSON 블록을 추출.
-    const action = parseJsonResponse<{
-      action: "explore" | "explore_parallel" | "done";
-      linkId?: string;
-      task?: string;
-      rationale?: string;
-      reason?: string;
-      branches?: Array<{ linkId?: string; task?: string; rationale?: string }>;
-    }>(actionJson);
-    if (!action) {
-      // JSON 파싱 실패 = LLM 응답 오류, 더 이상 탐색 불가
-      break;
+  for (let round = 1; round <= ORCHESTRATOR_MAX_ROUNDS; round++) {
+    const { text } = await client.complete("orchestrator", messages, { jsonResponse: true });
+    // LLM 응답은 항상 assistant 메시지로 append — 다음 라운드의 prefix cache 키 안정화.
+    messages.push({ role: "assistant", content: text });
+
+    const action = parseJsonResponse<ParsedAction>(text);
+    if (!action || typeof action.action !== "string") {
+      await logger.log("orchestrator_plan", "orchestrator", { round, action: "error", reason: "invalid JSON" });
+      messages.push(buildOrchestratorErrorMessage("Your previous response was not valid JSON or had no 'action' field.", searchCount, exploreCount));
+      continue;
     }
 
     if (action.action === "done") {
@@ -91,17 +115,184 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       break;
     }
 
-    if (action.action === "explore_parallel") {
-      // 남은 페이지 예산과 MAX_PARALLEL 중 작은 값까지만 동시 실행
-      const remainingBudget = MAX_PAGES - exploredUrls.length;
-      const limit = Math.min(MAX_PARALLEL, remainingBudget);
+    if (action.action === "search" || action.action === "paginate") {
+      if (searchCount >= ORCHESTRATOR_MAX_SEARCHES) {
+        const reason = `Search/paginate limit (${ORCHESTRATOR_MAX_SEARCHES}) reached.`;
+        await logger.log("orchestrator_plan", "orchestrator", { round, action: action.action, status: "limit", reason });
+        messages.push(buildOrchestratorErrorMessage(`${reason} Pick explore on existing SERP, or done.`, searchCount, exploreCount));
+        continue;
+      }
 
+      let engine: SearchEngine;
+      let query: string;
+      let page: number;
+
+      if (action.action === "search") {
+        if (typeof action.engine !== "string" || !isSupportedEngine(action.engine)) {
+          messages.push(buildOrchestratorErrorMessage(`Unsupported or missing engine. Use one of "google", "bing", "naver".`, searchCount, exploreCount));
+          continue;
+        }
+        if (typeof action.query !== "string" || !action.query.trim()) {
+          messages.push(buildOrchestratorErrorMessage(`search.query is required and must be a non-empty string.`, searchCount, exploreCount));
+          continue;
+        }
+        engine = action.engine;
+        query = action.query.trim();
+        page = typeof action.page === "number" && action.page >= 1 ? Math.floor(action.page) : 1;
+      } else {
+        // paginate
+        if (!currentSerp) {
+          messages.push(buildOrchestratorErrorMessage(`paginate requires an existing SERP. Use search first.`, searchCount, exploreCount));
+          continue;
+        }
+        if (typeof action.page !== "number" || action.page < 1) {
+          messages.push(buildOrchestratorErrorMessage(`paginate.page must be a positive integer.`, searchCount, exploreCount));
+          continue;
+        }
+        engine = currentSerp.engine;
+        query = currentSerp.query;
+        page = Math.floor(action.page);
+      }
+
+      if (searchHistory.some((h) => h.engine === engine && h.query === query && h.page === page)) {
+        messages.push(
+          buildOrchestratorErrorMessage(
+            `Already attempted ${engine}/"${query}" page ${page}. Pick a different query, engine, or page.`,
+            searchCount,
+            exploreCount
+          )
+        );
+        continue;
+      }
+
+      const url = buildSerpUrl(engine, query, page);
+      const pageId = `SERP-${round}`;
+
+      await logger.log("orchestrator_plan", "orchestrator", {
+        round,
+        action: action.action,
+        engine,
+        query,
+        page,
+        url,
+        rationale: action.rationale,
+      });
+
+      let result: ConvertResult;
+      try {
+        result = await convertPage(url, { scroll: false, stealth: true, pageId });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        // 실패한 시도도 history에 기록 — LLM이 같은 (engine,query,page) 재시도로 무한 루프 안 가게.
+        searchHistory.push({ engine, query, page });
+        searchCount++;
+        messages.push(
+          buildOrchestratorErrorMessage(
+            `Failed to load SERP for ${engine}/"${query}" page ${page}: ${detail}`,
+            searchCount,
+            exploreCount
+          )
+        );
+        continue;
+      }
+
+      const snippets = extractSerpSnippets(result.markdown, true);
+      currentSerp = { engine, query, page, url, result };
+      searchHistory.push({ engine, query, page });
+      searchCount++;
+
+      await logger.log("page_markdown", "orchestrator", {
+        url,
+        markdown: result.markdown,
+        pageId,
+      });
+
+      messages.push(buildSerpResultMessage(engine, query, page, snippets, searchCount, exploreCount));
+      continue;
+    }
+
+    if (action.action === "explore") {
+      if (!currentSerp) {
+        messages.push(buildOrchestratorErrorMessage(`explore requires a SERP. Use search first.`, searchCount, exploreCount));
+        continue;
+      }
+      if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
+        messages.push(
+          buildOrchestratorErrorMessage(
+            `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done with what you have.`,
+            searchCount,
+            exploreCount
+          )
+        );
+        continue;
+      }
+      if (typeof action.linkId !== "string" || !action.linkId) {
+        messages.push(buildOrchestratorErrorMessage(`explore.linkId is required.`, searchCount, exploreCount));
+        continue;
+      }
+      const entry = currentSerp.result.links.links[action.linkId];
+      if (!entry) {
+        messages.push(
+          buildOrchestratorErrorMessage(`linkId ${action.linkId} not found on the current SERP.`, searchCount, exploreCount)
+        );
+        continue;
+      }
+      if (exploredUrls.includes(entry.url)) {
+        messages.push(buildOrchestratorErrorMessage(`${entry.url} was already explored.`, searchCount, exploreCount));
+        continue;
+      }
+
+      exploredUrls.push(entry.url);
+      exploreCount++;
+
+      await logger.log("orchestrator_plan", "orchestrator", {
+        round,
+        action: "explore",
+        linkId: action.linkId,
+        url: entry.url,
+        task: action.task,
+        rationale: action.rationale,
+      });
+
+      const brief: MissionBrief = {
+        agentId: `explorer-${round}`,
+        parentAgentId: "orchestrator",
+        goal: action.task ?? options.query,
+        url: entry.url,
+        parentGoal: options.query,
+        depth: 0,
+      };
+
+      const report = await runExplorationAgent(brief, client, logger);
+      reports.push(report);
+      messages.push(buildExploreResultMessage(report, searchCount, exploreCount));
+      continue;
+    }
+
+    if (action.action === "explore_parallel") {
+      if (!currentSerp) {
+        messages.push(buildOrchestratorErrorMessage(`explore_parallel requires a SERP. Use search first.`, searchCount, exploreCount));
+        continue;
+      }
+      if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
+        messages.push(
+          buildOrchestratorErrorMessage(
+            `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done.`,
+            searchCount,
+            exploreCount
+          )
+        );
+        continue;
+      }
+
+      const remainingBudget = ORCHESTRATOR_MAX_EXPLORES - exploreCount;
+      const limit = Math.min(MAX_PARALLEL, remainingBudget);
       const rawBranches = Array.isArray(action.branches) ? action.branches : [];
-      // 유효한 branch만 수집: linkId 존재 + 미방문 + 같은 배치 내 URL 중복 없음
+
       const validBranches: Array<{ linkId: string; task?: string; rationale?: string; url: string }> = [];
       for (const b of rawBranches) {
-        if (!b || !b.linkId) continue;
-        const entry = serpResult.links.links[b.linkId];
+        if (!b || typeof b.linkId !== "string") continue;
+        const entry = currentSerp.result.links.links[b.linkId];
         if (!entry) continue;
         if (exploredUrls.includes(entry.url)) continue;
         if (validBranches.some((vb) => vb.url === entry.url)) continue;
@@ -109,12 +300,20 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         if (validBranches.length >= limit) break;
       }
 
-      // 유효한 branch가 하나도 없으면 다음 라운드에 LLM이 다시 선택하도록 continue
-      if (validBranches.length === 0) continue;
+      if (validBranches.length === 0) {
+        messages.push(
+          buildOrchestratorErrorMessage(
+            `No valid branches: all linkIds were missing on the current SERP or already explored.`,
+            searchCount,
+            exploreCount
+          )
+        );
+        continue;
+      }
 
-      // 모든 URL을 먼저 등록해 동일 배치 내 충돌 방지
       for (const vb of validBranches) {
         exploredUrls.push(vb.url);
+        exploreCount++;
       }
 
       await logger.log("orchestrator_plan", "orchestrator", {
@@ -138,66 +337,59 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         })
       );
       reports.push(...parallelReports);
+      messages.push(buildParallelExploreResultMessage(parallelReports, searchCount, exploreCount));
       continue;
     }
 
-    if (!action.linkId) break;
-
-    const entry = serpResult.links.links[action.linkId];
-    // 유효하지 않은 linkId이거나 이미 탐색한 URL인 경우 — break 대신 continue로 루프 유지.
-    // LLM이 실수로 잘못된 ID를 골랐을 때 다음 라운드에서 다른 링크를 선택할 기회를 준다.
-    if (!entry || exploredUrls.includes(entry.url)) continue;
-
-    await logger.log("orchestrator_plan", "orchestrator", {
-      round,
-      action: "explore",
-      linkId: action.linkId,
-      url: entry.url,
-      task: action.task,
-      rationale: action.rationale,
-    });
-
-    exploredUrls.push(entry.url);
-
-    const brief: MissionBrief = {
-      agentId: `explorer-${round}`,
-      parentAgentId: "orchestrator",
-      // task: 하위 에이전트에게 전달할 명확한 작업 지시 (rationale은 로그용)
-      goal: action.task ?? options.query,
-      url: entry.url,
-      parentGoal: options.query,
-      depth: 0, // 오케스트레이터가 생성하는 탐색 에이전트는 항상 depth 0에서 시작
-    };
-
-    const report = await runExplorationAgent(brief, client, logger);
-    reports.push(report);
+    // 알 수 없는 action — 에러 안내 후 다음 라운드에서 LLM이 재선택
+    messages.push(buildOrchestratorErrorMessage(`Unknown action "${action.action}".`, searchCount, exploreCount));
   }
 
-  // Step 4: 최종 답변 합성
-  // 각 explorer가 아젠틱 루프에서 자식 보고를 선별 통합한 summary를 반환하므로
-  // 오케스트레이터는 최상위 보고만 수신 — flattenReports 불필요.
+  // Step: 최종 답변 합성
+  // useSerpSynthesis=true가 되는 경우:
+  //   (a) explorer가 한 번도 디스패치되지 않음 (LLM이 바로 done 또는 search만 했음)
+  //   (b) explorer를 디스패치했지만 모든 보고가 found=false
+  // 두 경우 모두 실제 방문 페이지에서 확인된 정보가 없으므로 마지막 SERP 스니펫으로 폴백.
+  // currentSerp도 없으면(검색 자체를 안 한 경우) 빈 보고로 합성 → "no data" 메시지 생성.
   const usefulReports = reports.filter((r) => r.found);
-
-  // useSerpSynthesis=true가 되는 두 가지 경우:
-  //   (a) 탐색을 아예 하지 않음 (LLM이 1라운드에서 done 결정)
-  //   (b) 탐색했지만 모든 결과가 found=false
-  // 두 경우 모두 실제 방문 페이지에서 확인된 정보가 없으므로 SERP 스니펫으로 폴백.
   const useSerpSynthesis = usefulReports.length === 0;
-  const reportsForSynthesis: ExplorationReport[] = useSerpSynthesis
-    ? [{
+
+  let reportsForSynthesis: ExplorationReport[];
+  if (!useSerpSynthesis) {
+    reportsForSynthesis = usefulReports;
+  } else if (currentSerp) {
+    reportsForSynthesis = [
+      {
         agentId: "orchestrator",
-        url: googleUrl,
+        url: currentSerp.url,
         found: true,
         completeness: "partial",
         // 합성용이므로 링크 ID 제거 — 방문하지 않은 URL 인용 방지
-        summary: extractSerpSnippets(serpResult.markdown, false),
+        summary: extractSerpSnippets(currentSerp.result.markdown, false),
         relevantExcerpts: [],
-        missingInfo: ["Only Google result snippets were available; pages were not verified."],
+        missingInfo: ["Only search-engine snippets were available; pages were not verified."],
         tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-      }]
-    : usefulReports;
+      },
+    ];
+  } else {
+    reportsForSynthesis = [
+      {
+        agentId: "orchestrator",
+        url: "",
+        found: false,
+        completeness: "none",
+        summary: "No search was performed during this session.",
+        relevantExcerpts: [],
+        missingInfo: ["No data collected."],
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      },
+    ];
+  }
 
-  const { text: answer } = await client.complete("orchestrator", buildSynthesisPrompt(options.query, reportsForSynthesis, useSerpSynthesis));
+  const { text: answer } = await client.complete(
+    "orchestrator",
+    buildSynthesisPrompt(options.query, reportsForSynthesis, useSerpSynthesis)
+  );
   await logger.log("final_answer", "orchestrator", { answer });
   return answer;
 }

@@ -18,113 +18,193 @@ export const MAX_CHILD_CALLS_PER_AGENT = 3;
 // Phase 5에서 CLI 옵션 --max-parallel로 옵션화 예정.
 export const MAX_PARALLEL = 3;
 
-// 사용자 질문을 Google 검색에 최적화된 영어 쿼리로 변환.
-// 한국어 질문을 그대로 Google에 넣으면 영어 자료 접근이 제한되므로 사전 변환.
-export function buildSearchQueryPrompt(userQuery: string): LLMMessage[] {
+// 오케스트레이터 에이전틱 루프의 전체 라운드 상한 (LLM 판단 횟수).
+// search/paginate/explore/explore_parallel 모든 행동이 1라운드를 소비한다.
+// done이 라운드 도달 전에 나와야 정상.
+export const ORCHESTRATOR_MAX_ROUNDS = 12;
+
+// search + paginate 액션의 합계 상한.
+// 같은 쿼리/엔진/페이지 조합이 반복되지 않도록 추가로 dedup 한다.
+export const ORCHESTRATOR_MAX_SEARCHES = 5;
+
+// explore + explore_parallel로 디스패치 가능한 누적 explorer 수의 상한.
+// (기존 MAX_PAGES와 동일한 의미 — Phase 4에서 오케스트레이터 내부로 이동)
+export const ORCHESTRATOR_MAX_EXPLORES = 5;
+
+// 오케스트레이터 에이전틱 루프의 초기 프롬프트.
+// 이 시스템 메시지와 첫 user 메시지 이후, 매 라운드의 action JSON(assistant)과
+// action 실행 결과(user)가 append-only로 messages 배열에 추가된다.
+// → 시스템 프롬프트는 라운드와 무관하게 고정 → OpenAI prefix cache가 라운드 누적 동안 유지됨.
+//
+// 어떤 행동(search/paginate/explore/explore_parallel/done)을 언제 할지는 LLM의 자율 판단.
+// 종료 조건도 LLM이 휴리스틱으로 결정 — 정보 충분 / 반복 실패 / 관련성 하락.
+export function buildOrchestratorInitialPrompt(userQuery: string): LLMMessage[] {
   return [
     {
       role: "system",
-      content:
-        "You are a search query specialist. Given a user's question, produce a single, concise Google search query (no longer than 10 words) that will find the most relevant pages. Output only the raw query string with no explanation, no quotes.",
-    },
-    {
-      role: "user",
-      content: userQuery,
-    },
-  ];
-}
+      content: `You are a research orchestrator with full autonomy over the search process.
 
-// 오케스트레이터가 매 라운드 SERP를 보고 "더 탐색할지 / 종료할지" 판단하는 프롬프트.
-// serpMarkdown: 링크 ID가 포함된 SERP 스니펫 (keepLinkIds=true로 추출).
-//   링크 ID를 남겨두는 이유 — LLM이 linkId를 응답에 명시해야 하는데, 없으면 할루시네이션.
-// reports: 상위 레벨 탐색 보고만 포함 (자식 보고는 explorer가 선별해 summary에 통합).
-export function buildNextActionPrompt(
-  userQuery: string,
-  serpMarkdown: string,
-  reports: ExplorationReport[],
-  exploredUrls: string[],
-  maxPages: number
-): LLMMessage[] {
-  const findingsSummary =
-    reports.length === 0
-      ? "None yet."
-      : reports
-          .map((r, i) => {
-            const missing = r.missingInfo.length > 0 ? `\n  missing=${r.missingInfo.join("; ")}` : "";
-            return `[${i + 1}] ${r.url}\n  found=${r.found}, completeness=${r.completeness} — ${r.summary}${missing}`;
-          })
-          .join("\n\n");
+Output format requirement (read first): respond with a single JSON object only — no prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes below and nothing else.
 
-  const exploredList = exploredUrls.length === 0 ? "None." : exploredUrls.map((u) => `- ${u}`).join("\n");
+You operate as an agentic loop. Each round you choose ONE action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the user's question, or until further search is clearly unproductive.
 
-  return [
-    {
-      role: "system",
-      content: `You are a research agent deciding how to proceed with a web search.
+Available actions:
 
-Output format requirement (read first): respond with a single JSON object only. No prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes shown below and nothing else.
+1. search — fetch a fresh search-engine results page (SERP). Pick the engine and query freely.
+   Engines supported:
+   - "google": broad English / global web. Default for most topics.
+   - "naver": Korean web. Best for Korean-domestic topics — laws, regulations, domestic media, Korean-language documentation, communities.
+   - "bing": secondary general web. Sometimes ranks differently from google; useful when google looks saturated.
+   {"action": "search", "engine": "google", "query": "concise search query", "rationale": "why this engine and this query"}
 
-You have access to a Google search results page. Based on findings so far, choose exactly one of:
-1. Explore one page — when the next page to visit depends on what the current findings tell you, or when only one unvisited candidate is worth dispatching right now
-2. Explore multiple pages in parallel — when 2-${MAX_PARALLEL} unvisited candidates are independently worth exploring AND none of them needs to see another's result before being dispatched
-3. Stop — if you already have enough information to give a complete, reliable answer
+2. paginate — move to a different page of the CURRENT SERP (same engine, same query, different page number).
+   {"action": "paginate", "page": 2, "rationale": "why later pages might surface better candidates"}
 
-Rules:
-- Only explore if it would meaningfully improve the answer
-- Never re-explore an already-visited URL
-- You have explored ${exploredUrls.length} of max ${maxPages} pages
-- If findings contain information that seems inferred or imprecise (e.g., dates estimated from context), consider exploring a more authoritative source
-- Even if current findings appear to answer the question, inspect the remaining SERP candidates before choosing done.
-- If an unexplored SERP result is likely to be clearer, more structured, more authoritative, or better for verification, choose Explore instead of Stop.
-- Stop only when you have strong confidence in the answer, or when no relevant unvisited SERP candidate is likely to improve completeness or reliability.
-- Do not explore just to be broad; explore only when the page is likely to improve completeness, precision, authority, or verification.
+3. explore — dispatch a sub-agent to one link from the current SERP. The sub-agent treats the chosen URL as its starting point and may follow further links itself.
+   {"action": "explore", "linkId": "L3", "task": "what the sub-agent should find", "rationale": "why this link"}
 
-Parallel vs serial — choose by dependency, not by breadth:
+4. explore_parallel — dispatch 2-${MAX_PARALLEL} sub-agents to independent links from the current SERP in parallel.
+   {"action": "explore_parallel", "branches": [{"linkId": "L1", "task": "...", "rationale": "..."}, {"linkId": "L4", "task": "...", "rationale": "..."}], "rationale": "why these branches are independent"}
 
-Use explore_parallel (must) when 2-${MAX_PARALLEL} branches are independent and ALL are needed. Patterns:
-- Aspect decomposition: distinct facts about one subject live on different canonical pages, and no fact changes how another should be looked up (e.g., a company's headcount, headquarters location, and founding year on three separate official or reference pages).
-- Comparison: the same attribute looked up across multiple subjects, each on its own page (e.g., the spec sheet of two competing products to compare a single field).
-- List completion from complementary sources: each source contributes a disjoint slice of the list you need to assemble.
+5. done — terminate and synthesize the answer.
+   {"action": "done", "reason": "why stopping now"}
 
-Use serial explore (must) when later choices depend on earlier results. Patterns:
-- Drill-down: you cannot phrase the next task until you have read the current page (e.g., to find the most-cited work of a recent award winner you must first identify the winner from one page, then look up their citations on another).
-- Conditional fallback: one authoritative page is likely enough; visit secondary candidates only if it does not answer. Saves budget when the first source suffices.
-- Bridge question: the answer of one lookup IS the subject of the next (e.g., "Who founded the company that acquired X?" — the acquirer must be resolved before its founder can be searched).
+When to choose done — apply these gates strictly:
 
-When dependency is unclear, lean toward the efficient option:
-- All candidates would be visited regardless of each other's results → prefer parallel; it saves wall-clock without changing the outcome.
-- A single page clearly dominates the rest or is likely sufficient → prefer a single explore; do not batch for breadth's sake.
-- Any suspicion that one branch's result would reshape another branch's task → prefer serial; do not run work you may have to discard.
+Pre-done verification gate (must satisfy BEFORE returning done):
+- For list, history, "all of X", comprehensive coverage, or "역대/전체/모든" style questions, you MUST run at least one explore on an authoritative source page before done. SERP snippets alone never constitute a verified complete list — they show only the top fragments search engines chose to render.
+- For factual questions, prefer at least one explore on an authoritative page unless the SERP snippets contain the exact answer phrased identically across multiple snippets.
+- Before choosing done, ask yourself: would an unvisited authoritative-looking candidate on the current SERP plausibly add, complete, or correct a name / date / number / list item? If yes, explore it before done.
+- Partial-report follow-up: if ANY explore result you have received above reported completeness="partial" with a non-empty missingInfo, you must take one more targeted action — explore a different SERP candidate, paginate, or run a refined search that addresses that missingInfo — before you may choose done. You may proceed to done despite a partial report only if you have separately tried (in a later round) to fill the gap and that attempt also failed to add verifiable information.
+- When reading each explore result, treat its missingInfo field as a literal todo list for your next action, not as a footnote you can ignore.
 
-Do NOT use explore_parallel for:
-- Duplicates or paraphrases of the same primary source (the same article in different languages, multiple outlets republishing one wire story, aggregators that repackage a single source). Pick the most authoritative one instead.
-- "Safety" candidates added just in case — only batch what you would have visited anyway under serial.
+Conditions that justify done:
+- You have explored enough authoritative pages that the visited material directly contains the verifiable information required by the question.
+- You have tried several distinct queries / engines / pages and they consistently return low-relevance, spam-like, or repeated results.
+- Relevance of new candidates is clearly declining round over round.
 
-Respond with JSON only (no markdown code fences):
-Explore one:        {"action": "explore", "linkId": "L5", "task": "Concise instruction for the sub-agent (what to find)", "rationale": "Why this page is worth exploring"}
-Explore in parallel:{"action": "explore_parallel", "branches": [{"linkId": "L3", "task": "...", "rationale": "..."}, {"linkId": "L7", "task": "...", "rationale": "..."}], "rationale": "Why these branches are independent"}
-Stop:               {"action": "done", "reason": "Why current findings are sufficient"}
+Do NOT choose done because:
+- "I already know this from training" — your training data is not a permitted source in this loop.
+- "The SERP snippets mention some of the items" — partial mention is not verification; for list-style questions, verify the full list on an actual page.
 
-Rules for task vs rationale:
-- task: short imperative instruction stating WHAT the sub-agent should find, treating the chosen URL as ITS starting point (the sub-agent may follow further links from there). E.g. "Faker 페이지를 기점으로 함께한 역대 탑라이너 목록 추출"
-- rationale: brief justification for WHY this URL was selected (for logging only)
-The linkId MUST be one of the IDs (e.g. [L5]) visible in the search results above. Do not invent IDs.
-In explore_parallel, every branch must use a distinct linkId visible above; do not repeat IDs.`,
+Engine and query strategy:
+- Start with whichever engine best fits the topic — naver for Korean-domestic subjects, google otherwise.
+- Reformulate the query before reaching for pagination. Change key terms, add qualifiers (year, jurisdiction, technical vocabulary), or switch language (Korean ↔ English).
+- Switch engines if one keeps returning irrelevant / spam-like results.
+- Do not repeat the exact same (engine, query, page) triple.
+
+Pagination guidance:
+- Paginate only when the current page's top candidates look reasonable and you want more of the same kind.
+- If the first page is filled with off-topic results, prefer a query change over pagination.
+
+explore vs explore_parallel:
+- Parallel for independent branches that all need to be visited (aspect decomposition, comparisons, complementary list sources).
+- Serial when later choices depend on earlier results (drill-down, conditional fallback, bridge questions).
+- Do not parallel-dispatch redundant or duplicate sources.
+
+Hard limits (the system will inject a notice when a limit is hit; respond by switching strategy or returning done):
+- At most ${ORCHESTRATOR_MAX_ROUNDS} total actions.
+- At most ${ORCHESTRATOR_MAX_SEARCHES} search/paginate actions combined.
+- At most ${ORCHESTRATOR_MAX_EXPLORES} explorer dispatches (each branch of explore_parallel counts as one).
+
+Important:
+- linkId must come from the most recent SERP shown above. Do not invent IDs.
+- Do not reference content from prior knowledge — only from action results in this conversation.
+- The first user message gives the original question. Choose your first action from there.
+
+Grounding rule for done.reason (read carefully):
+- The "reason" field of a done action must reference ONLY information that has actually appeared earlier in this conversation as an action result (a SERP snippet or an explore report). It must not contain names, dates, numbers, or facts that have not appeared above.
+- If you find yourself wanting to write a "reason" that lists items not present in prior action results, that is a signal to explore one more page rather than stop.
+- Acceptable reason: "T1 official roster page confirmed top-laners A, B, C across the seasons listed there." Unacceptable reason: a roll-up of names you remember from training and never saw in any action result above.`,
     },
     {
       role: "user",
       content: `User question: ${userQuery}
 
-Search results:
-${serpMarkdown}
-
-Already explored (${exploredUrls.length}/${maxPages}):
-${exploredList}
-
-Findings so far:
-${findingsSummary}`,
+Choose your first action.`,
     },
   ];
+}
+
+// search/paginate 액션이 성공적으로 SERP를 가져온 뒤 messages에 append할 user 메시지.
+// serpSnippets: 링크 ID를 유지한 Main Content 추출 결과.
+export function buildSerpResultMessage(
+  engine: string,
+  query: string,
+  page: number,
+  serpSnippets: string,
+  searchesUsed: number,
+  exploresUsed: number
+): LLMMessage {
+  const body = serpSnippets.trim() || "(no usable results found on this page)";
+  return {
+    role: "user",
+    content: `[SERP — engine=${engine}, query="${query}", page=${page}]
+${body}
+
+(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+
+Choose your next action.`,
+  };
+}
+
+// 단일 explore 결과를 messages에 append할 user 메시지.
+export function buildExploreResultMessage(report: ExplorationReport, searchesUsed: number, exploresUsed: number): LLMMessage {
+  const excerptText =
+    report.relevantExcerpts.length > 0
+      ? `\nKey excerpts:\n${report.relevantExcerpts.map((e) => `  - ${e}`).join("\n")}`
+      : "";
+  return {
+    role: "user",
+    content: `[explore result — ${report.url}]
+found: ${report.found}
+completeness: ${report.completeness}
+summary: ${report.summary}${excerptText}
+missingInfo: ${report.missingInfo.length ? report.missingInfo.join("; ") : "None"}
+
+(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+
+Choose your next action.`,
+  };
+}
+
+// explore_parallel 결과(여러 보고)를 한 번에 messages에 append.
+export function buildParallelExploreResultMessage(
+  reports: ExplorationReport[],
+  searchesUsed: number,
+  exploresUsed: number
+): LLMMessage {
+  const body = reports
+    .map((r, i) => {
+      const excerptText =
+        r.relevantExcerpts.length > 0 ? `\n  excerpts: ${r.relevantExcerpts.map((e) => `"${e}"`).join(" | ")}` : "";
+      const missing = r.missingInfo.length ? `\n  missingInfo: ${r.missingInfo.join("; ")}` : "";
+      return `[${i + 1}] ${r.url}\n  found=${r.found}, completeness=${r.completeness}\n  summary: ${r.summary}${excerptText}${missing}`;
+    })
+    .join("\n\n");
+
+  return {
+    role: "user",
+    content: `[parallel explore results — ${reports.length} branches]
+${body}
+
+(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+
+Choose your next action.`,
+  };
+}
+
+// 잘못된 액션(파싱 실패, 무효 linkId, 한도 초과 등)에 대한 안내 메시지.
+// LLM이 다음 라운드에서 다른 행동을 선택하도록 유도한다.
+export function buildOrchestratorErrorMessage(detail: string, searchesUsed: number, exploresUsed: number): LLMMessage {
+  return {
+    role: "user",
+    content: `[action could not be executed] ${detail}
+
+(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+
+Choose a different action.`,
+  };
 }
 
 // 탐색 에이전트 아젠틱 루프의 초기 프롬프트.
