@@ -31,6 +31,167 @@ export const ORCHESTRATOR_MAX_SEARCHES = 5;
 // (기존 MAX_PAGES와 동일한 의미 — Phase 4에서 오케스트레이터 내부로 이동)
 export const ORCHESTRATOR_MAX_EXPLORES = 5;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON Schemas (OpenAI Structured Outputs / json_schema strict 모드)
+// ─────────────────────────────────────────────────────────────────────────────
+// 각 schema는 LLM 응답이 정확히 한 가지 행동(action) 형태를 따르도록 강제한다.
+// anyOf 안의 각 가지가 action 값으로 자기를 구분(discriminated union).
+//
+// strict 모드 제약:
+//   - additionalProperties: false 필수
+//   - 모든 property는 required에 포함
+//   - 옵션 필드는 type을 ["string", "null"] 같은 union으로 표현 (현재 스키마에는 없음)
+//
+// 스키마가 응답을 강제하므로 프롬프트에서 "Respond with JSON only..." 같은 예시는 불필요.
+
+const explorerActionExplore = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["explore"] },
+    linkId: { type: "string", description: "Link ID such as L3 visible on the current page" },
+    task: { type: "string", description: "Concise instruction for the sub-agent" },
+    rationale: { type: "string", description: "Why this link is worth exploring" },
+  },
+  required: ["action", "linkId", "task", "rationale"],
+  additionalProperties: false,
+} as const;
+
+const explorerActionDone = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["done"] },
+    found: { type: "boolean", description: "Whether relevant information was found on the visited pages" },
+    completeness: {
+      type: "string",
+      enum: ["complete", "partial", "none"],
+      description: "complete = full answer verified; partial = some gaps; none = nothing relevant",
+    },
+    summary: { type: "string", description: "2-5 sentence digest based only on visited pages" },
+    relevantExcerpts: {
+      type: "array",
+      items: { type: "string" },
+      description: "Up to 3 short verbatim quotes from the visited pages (no link IDs)",
+    },
+    missingInfo: {
+      type: "array",
+      items: { type: "string" },
+      description: "List of items that the visited pages did not verify; empty when completeness=complete",
+    },
+  },
+  required: ["action", "found", "completeness", "summary", "relevantExcerpts", "missingInfo"],
+  additionalProperties: false,
+} as const;
+
+// OpenAI Structured Outputs 제약: 루트 스키마는 type: "object"여야 하며 anyOf가 루트에 올 수 없다.
+// 따라서 discriminated union은 하나의 속성(`decision`) 안에 anyOf로 감싼다.
+// LLM 출력 예: {"decision": {"action": "search", "engine": "google", ...}}
+// 호출부는 parseJsonResponse 결과의 .decision 필드를 꺼내 사용한다.
+function wrapDecisionSchema(name: string, branches: readonly unknown[]) {
+  return {
+    name,
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        decision: branches.length === 1 ? branches[0] : { anyOf: branches },
+      },
+      required: ["decision"],
+      additionalProperties: false,
+    },
+  } as const;
+}
+
+// 탐색 에이전트가 자식 호출을 더 할 수 있을 때 사용 (depth < MAX_DEPTH).
+// explore / done 둘 다 가능.
+export const explorerActionSchemaCanExplore = wrapDecisionSchema("explorer_action", [
+  explorerActionExplore,
+  explorerActionDone,
+]);
+
+// 탐색 에이전트가 자식 호출을 더 할 수 없을 때 (depth >= MAX_DEPTH).
+// done만 허용.
+export const explorerActionSchemaTerminal = wrapDecisionSchema("explorer_action_terminal", [explorerActionDone]);
+
+const orchestratorActionSearch = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["search"] },
+    engine: { type: "string", enum: ["google", "naver", "bing"] },
+    query: { type: "string", description: "Concise search query" },
+    rationale: { type: "string", description: "Why this engine and this query" },
+  },
+  required: ["action", "engine", "query", "rationale"],
+  additionalProperties: false,
+} as const;
+
+const orchestratorActionPaginate = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["paginate"] },
+    page: { type: "integer", minimum: 1, description: "Target page number (1-based)" },
+    rationale: { type: "string" },
+  },
+  required: ["action", "page", "rationale"],
+  additionalProperties: false,
+} as const;
+
+const orchestratorActionExploreSingle = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["explore"] },
+    linkId: { type: "string", description: "Link ID from the most recent SERP" },
+    task: { type: "string", description: "What the sub-agent should find" },
+    rationale: { type: "string" },
+  },
+  required: ["action", "linkId", "task", "rationale"],
+  additionalProperties: false,
+} as const;
+
+const orchestratorActionExploreParallel = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["explore_parallel"] },
+    branches: {
+      type: "array",
+      minItems: 2,
+      maxItems: MAX_PARALLEL,
+      items: {
+        type: "object",
+        properties: {
+          linkId: { type: "string" },
+          task: { type: "string" },
+          rationale: { type: "string" },
+        },
+        required: ["linkId", "task", "rationale"],
+        additionalProperties: false,
+      },
+    },
+    rationale: { type: "string", description: "Why these branches are independent" },
+  },
+  required: ["action", "branches", "rationale"],
+  additionalProperties: false,
+} as const;
+
+const orchestratorActionDone = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["done"] },
+    reason: { type: "string", description: "Why stopping now; must reference only action results from above" },
+  },
+  required: ["action", "reason"],
+  additionalProperties: false,
+} as const;
+
+// 오케스트레이터의 매 라운드 행동.
+// 5종 중 정확히 하나. (루트는 wrapDecisionSchema 규약대로 { decision: ... } 형태로 감싸짐.)
+export const orchestratorActionSchema = wrapDecisionSchema("orchestrator_action", [
+  orchestratorActionSearch,
+  orchestratorActionPaginate,
+  orchestratorActionExploreSingle,
+  orchestratorActionExploreParallel,
+  orchestratorActionDone,
+]);
+
 // 오케스트레이터 에이전틱 루프의 초기 프롬프트.
 // 이 시스템 메시지와 첫 user 메시지 이후, 매 라운드의 action JSON(assistant)과
 // action 실행 결과(user)가 append-only로 messages 배열에 추가된다.
@@ -44,30 +205,23 @@ export function buildOrchestratorInitialPrompt(userQuery: string): LLMMessage[] 
       role: "system",
       content: `You are a research orchestrator with full autonomy over the search process.
 
-Output format requirement (read first): respond with a single JSON object only — no prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes below and nothing else.
-
-You operate as an agentic loop. Each round you choose ONE action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the user's question, or until further search is clearly unproductive.
+You operate as an agentic loop. Each round you choose ONE action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the user's question, or until further search is clearly unproductive. Your response is constrained by a JSON schema — choose exactly one of the five action variants.
 
 Available actions:
 
-1. search — fetch a fresh search-engine results page (SERP). Pick the engine and query freely.
+1. search — fetch a fresh search-engine results page (SERP). You pick engine and query.
    Engines supported:
    - "google": broad English / global web. Default for most topics.
    - "naver": Korean web. Best for Korean-domestic topics — laws, regulations, domestic media, Korean-language documentation, communities.
    - "bing": secondary general web. Sometimes ranks differently from google; useful when google looks saturated.
-   {"action": "search", "engine": "google", "query": "concise search query", "rationale": "why this engine and this query"}
 
-2. paginate — move to a different page of the CURRENT SERP (same engine, same query, different page number).
-   {"action": "paginate", "page": 2, "rationale": "why later pages might surface better candidates"}
+2. paginate — move to a different page of the CURRENT SERP (same engine, same query).
 
-3. explore — dispatch a sub-agent to one link from the current SERP. The sub-agent treats the chosen URL as its starting point and may follow further links itself.
-   {"action": "explore", "linkId": "L3", "task": "what the sub-agent should find", "rationale": "why this link"}
+3. explore — dispatch a sub-agent to one linkId from the current SERP. The sub-agent treats the chosen URL as its starting point and may follow further links itself.
 
-4. explore_parallel — dispatch 2-${MAX_PARALLEL} sub-agents to independent links from the current SERP in parallel.
-   {"action": "explore_parallel", "branches": [{"linkId": "L1", "task": "...", "rationale": "..."}, {"linkId": "L4", "task": "...", "rationale": "..."}], "rationale": "why these branches are independent"}
+4. explore_parallel — dispatch 2-${MAX_PARALLEL} sub-agents in parallel to independent linkIds from the current SERP.
 
 5. done — terminate and synthesize the answer.
-   {"action": "done", "reason": "why stopping now"}
 
 When to choose done — apply these gates strictly:
 
@@ -231,15 +385,13 @@ Critical rules for summary and excerpts:
 ${linkDecisionRules}`;
 
   const systemContent = canExplore
-    ? `You are a focused research agent with a specific goal.
-
-Output format requirement (read first): respond with a single JSON object only. No prose, no chain-of-thought, no markdown code fences, no text before or after the JSON. Output exactly one of the JSON shapes shown below and nothing else.
+    ? `You are a focused research agent with a specific goal. Your response is constrained by a JSON schema — choose exactly one of the two action variants (explore or done).
 
 The given web page is your starting point. Your goal may be answerable from this page alone, or it may require following links on this page to other pages — you can dispatch a sub-agent to any linked page, and that sub-agent can in turn dispatch its own sub-agents. Treat link-following as a normal part of the mission, not a last resort.
 
 At each step, choose exactly one of these two options (they are equal choices — neither is the default):
-- Explore: dispatch a sub-agent to a linked page on this page (you can do this up to ${MAX_CHILD_CALLS_PER_AGENT} times total during this mission)
-- Done: stop and return your final report
+- explore: dispatch a sub-agent to a linked page on this page (you can do this up to ${MAX_CHILD_CALLS_PER_AGENT} times total during this mission)
+- done: stop and return your final report
 
 Choose \`done\` only when BOTH hold:
 (a) no remaining link on this page appears likely to contain additional, more authoritative, or more verifiable information beyond what you have already gathered, AND
@@ -248,31 +400,20 @@ Choose \`done\` only when BOTH hold:
 Important: once you return \`done\`, this page and every page reachable from it are locked — you cannot revisit, extend, or correct the report later. Decide carefully.
 ${groundingRules}
 
-Link IDs look like [L1], [L2], etc.
+Link IDs in the page look like [L1], [L2], etc. The linkId field must reference one of these — do not invent IDs.
 
-Respond with JSON only (no markdown code fences):
-Explore: {"action": "explore", "linkId": "L3", "task": "Concise instruction for the sub-agent (treating the chosen linked page as ITS starting point)", "rationale": "Why this link is worth exploring"}
-Done:    {"action": "done", "found": true, "completeness": "complete", "summary": "2-5 sentence digest of findings, based on the pages you have visited", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": []}
-Partial: {"action": "done", "found": true, "completeness": "partial", "summary": "Relevant but incomplete findings, based on the pages you have visited", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": ["what is missing"]}
-
-Rules:
-- The linkId MUST appear in the page content above. Do not invent IDs.
-- For broad questions asking for all/history/complete lists, do not return completeness="complete" unless the information gathered across visited pages explicitly supports full coverage.
-- Always omit link IDs from relevantExcerpts
-- task: short imperative instruction stating WHAT the sub-agent should find, using the chosen linked page as ITS starting point (the sub-agent may follow further links from there). E.g. "T1 팀 페이지를 기점으로 시즌별 탑라이너 로스터 추출"
-
-If nothing relevant found:
-{"action": "done", "found": false, "completeness": "none", "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "missingInfo": []}`
-    : `You are a focused research agent with a specific goal.
+Rules for the fields:
+- task (explore): short imperative instruction stating WHAT the sub-agent should find, using the chosen linked page as ITS starting point (the sub-agent may follow further links from there). E.g. "T1 팀 페이지를 기점으로 시즌별 탑라이너 로스터 추출"
+- relevantExcerpts (done): up to 3 short verbatim quotes. Always omit link IDs like [L1] from quoted text.
+- completeness (done): for broad questions asking for all/history/complete lists, do not return "complete" unless the information gathered across visited pages explicitly supports full coverage. Prefer "partial" with explicit missingInfo when in doubt.
+- found=false + completeness=none: use when the page did not contain relevant information.`
+    : `You are a focused research agent with a specific goal. Your response is constrained by a JSON schema — you must return a done action.
 Analyze the given web page and find information relevant to the goal. You cannot explore further links.
 ${groundingRules}
 
-Respond with JSON only (no markdown code fences):
-{"action": "done", "found": true, "completeness": "complete", "summary": "2-5 sentence digest of relevant findings from this page only", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": []}
-Partial: {"action": "done", "found": true, "completeness": "partial", "summary": "Relevant but incomplete findings from this page only", "relevantExcerpts": ["up to 3 short verbatim quotes — omit link IDs like [L1]"], "missingInfo": ["what is missing or which verification could not be performed"]}
-
-If nothing relevant found:
-{"action": "done", "found": false, "completeness": "none", "summary": "Page did not contain relevant information.", "relevantExcerpts": [], "missingInfo": []}`;
+Rules for the fields:
+- relevantExcerpts: up to 3 short verbatim quotes. Always omit link IDs like [L1] from quoted text.
+- completeness: "complete" only when this single page explicitly contains all required information; otherwise "partial" with explicit missingInfo, or "none" with found=false if irrelevant.`;
 
   return [
     { role: "system", content: systemContent },

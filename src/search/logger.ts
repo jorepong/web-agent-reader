@@ -154,8 +154,8 @@ export class DebugLogger {
         } else if (action === "explore") {
           process.stderr.write(`${tag} [${round}라운드] 판단: 탐색 → ${p["url"]} (${p["linkId"]})\n`);
           if (p["rationale"]) process.stderr.write(`  이유: ${p["rationale"]}\n`);
-        } else if (action === "error") {
-          process.stderr.write(`${tag} [${round}라운드] 판단 오류 — ${p["reason"]}\n`);
+        } else if (action === "rejected") {
+          process.stderr.write(`${tag} [${round}라운드] 판단 거부 (${String(p["requestedAction"] ?? "?")}) — ${p["reason"]}\n`);
         } else {
           process.stderr.write(`${tag} [${round}라운드] 판단: ${String(action)} (${String(p["reason"] ?? "")})\n`);
         }

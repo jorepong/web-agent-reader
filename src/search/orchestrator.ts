@@ -32,6 +32,7 @@ import {
   ORCHESTRATOR_MAX_EXPLORES,
   ORCHESTRATOR_MAX_ROUNDS,
   ORCHESTRATOR_MAX_SEARCHES,
+  orchestratorActionSchema,
 } from "./prompts.js";
 import { buildSerpUrl, isSupportedEngine, type SearchEngine } from "./search-engines.js";
 import type { ConvertResult } from "../types.js";
@@ -99,14 +100,31 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   let exploreCount = 0;
 
   for (let round = 1; round <= ORCHESTRATOR_MAX_ROUNDS; round++) {
-    const { text } = await client.complete("orchestrator", messages, { jsonResponse: true });
+    // 거부 경로 공통 로깅 + 에러 메시지 주입.
+    // 모든 거부(파싱 실패 / 무효 입력 / 한도 초과 / 이미 방문 / 알 수 없는 action)는
+    // orchestrator_plan 이벤트로 남도록 통일 → 매 라운드의 결정이 디버그 로그에 흔적을 남긴다.
+    const reject = async (requestedAction: string, reason: string, context: Record<string, unknown> = {}) => {
+      await logger.log("orchestrator_plan", "orchestrator", {
+        round,
+        action: "rejected",
+        requestedAction,
+        reason,
+        ...context,
+      });
+      messages.push(buildOrchestratorErrorMessage(reason, searchCount, exploreCount));
+    };
+
+    const { text } = await client.complete("orchestrator", messages, { responseSchema: orchestratorActionSchema });
     // LLM 응답은 항상 assistant 메시지로 append — 다음 라운드의 prefix cache 키 안정화.
     messages.push({ role: "assistant", content: text });
 
-    const action = parseJsonResponse<ParsedAction>(text);
+    // 스키마가 { decision: <action> } 형태로 응답을 감싸므로 .decision 필드를 꺼낸다.
+    const wrapper = parseJsonResponse<{ decision?: ParsedAction }>(text);
+    const action = wrapper?.decision;
     if (!action || typeof action.action !== "string") {
-      await logger.log("orchestrator_plan", "orchestrator", { round, action: "error", reason: "invalid JSON" });
-      messages.push(buildOrchestratorErrorMessage("Your previous response was not valid JSON or had no 'action' field.", searchCount, exploreCount));
+      await reject("unknown", "Your previous response was not valid JSON or had no 'decision.action' field.", {
+        rawResponsePreview: text.slice(0, 200),
+      });
       continue;
     }
 
@@ -117,9 +135,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
     if (action.action === "search" || action.action === "paginate") {
       if (searchCount >= ORCHESTRATOR_MAX_SEARCHES) {
-        const reason = `Search/paginate limit (${ORCHESTRATOR_MAX_SEARCHES}) reached.`;
-        await logger.log("orchestrator_plan", "orchestrator", { round, action: action.action, status: "limit", reason });
-        messages.push(buildOrchestratorErrorMessage(`${reason} Pick explore on existing SERP, or done.`, searchCount, exploreCount));
+        await reject(action.action, `Search/paginate limit (${ORCHESTRATOR_MAX_SEARCHES}) reached. Pick explore on existing SERP, or done.`);
         continue;
       }
 
@@ -129,11 +145,13 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
       if (action.action === "search") {
         if (typeof action.engine !== "string" || !isSupportedEngine(action.engine)) {
-          messages.push(buildOrchestratorErrorMessage(`Unsupported or missing engine. Use one of "google", "bing", "naver".`, searchCount, exploreCount));
+          await reject("search", `Unsupported or missing engine. Use one of "google", "bing", "naver".`, {
+            providedEngine: action.engine,
+          });
           continue;
         }
         if (typeof action.query !== "string" || !action.query.trim()) {
-          messages.push(buildOrchestratorErrorMessage(`search.query is required and must be a non-empty string.`, searchCount, exploreCount));
+          await reject("search", `search.query is required and must be a non-empty string.`);
           continue;
         }
         engine = action.engine;
@@ -142,11 +160,11 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       } else {
         // paginate
         if (!currentSerp) {
-          messages.push(buildOrchestratorErrorMessage(`paginate requires an existing SERP. Use search first.`, searchCount, exploreCount));
+          await reject("paginate", `paginate requires an existing SERP. Use search first.`);
           continue;
         }
         if (typeof action.page !== "number" || action.page < 1) {
-          messages.push(buildOrchestratorErrorMessage(`paginate.page must be a positive integer.`, searchCount, exploreCount));
+          await reject("paginate", `paginate.page must be a positive integer.`, { providedPage: action.page });
           continue;
         }
         engine = currentSerp.engine;
@@ -155,13 +173,11 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       }
 
       if (searchHistory.some((h) => h.engine === engine && h.query === query && h.page === page)) {
-        messages.push(
-          buildOrchestratorErrorMessage(
-            `Already attempted ${engine}/"${query}" page ${page}. Pick a different query, engine, or page.`,
-            searchCount,
-            exploreCount
-          )
-        );
+        await reject(action.action, `Already attempted ${engine}/"${query}" page ${page}. Pick a different query, engine, or page.`, {
+          engine,
+          query,
+          page,
+        });
         continue;
       }
 
@@ -186,13 +202,13 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         // 실패한 시도도 history에 기록 — LLM이 같은 (engine,query,page) 재시도로 무한 루프 안 가게.
         searchHistory.push({ engine, query, page });
         searchCount++;
-        messages.push(
-          buildOrchestratorErrorMessage(
-            `Failed to load SERP for ${engine}/"${query}" page ${page}: ${detail}`,
-            searchCount,
-            exploreCount
-          )
-        );
+        await reject(action.action, `Failed to load SERP for ${engine}/"${query}" page ${page}: ${detail}`, {
+          engine,
+          query,
+          page,
+          url,
+          error: detail,
+        });
         continue;
       }
 
@@ -213,32 +229,24 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
     if (action.action === "explore") {
       if (!currentSerp) {
-        messages.push(buildOrchestratorErrorMessage(`explore requires a SERP. Use search first.`, searchCount, exploreCount));
+        await reject("explore", `explore requires a SERP. Use search first.`);
         continue;
       }
       if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
-        messages.push(
-          buildOrchestratorErrorMessage(
-            `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done with what you have.`,
-            searchCount,
-            exploreCount
-          )
-        );
+        await reject("explore", `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done with what you have.`);
         continue;
       }
       if (typeof action.linkId !== "string" || !action.linkId) {
-        messages.push(buildOrchestratorErrorMessage(`explore.linkId is required.`, searchCount, exploreCount));
+        await reject("explore", `explore.linkId is required.`);
         continue;
       }
       const entry = currentSerp.result.links.links[action.linkId];
       if (!entry) {
-        messages.push(
-          buildOrchestratorErrorMessage(`linkId ${action.linkId} not found on the current SERP.`, searchCount, exploreCount)
-        );
+        await reject("explore", `linkId ${action.linkId} not found on the current SERP.`, { linkId: action.linkId });
         continue;
       }
       if (exploredUrls.includes(entry.url)) {
-        messages.push(buildOrchestratorErrorMessage(`${entry.url} was already explored.`, searchCount, exploreCount));
+        await reject("explore", `${entry.url} was already explored.`, { linkId: action.linkId, url: entry.url });
         continue;
       }
 
@@ -271,17 +279,11 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
 
     if (action.action === "explore_parallel") {
       if (!currentSerp) {
-        messages.push(buildOrchestratorErrorMessage(`explore_parallel requires a SERP. Use search first.`, searchCount, exploreCount));
+        await reject("explore_parallel", `explore_parallel requires a SERP. Use search first.`);
         continue;
       }
       if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
-        messages.push(
-          buildOrchestratorErrorMessage(
-            `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done.`,
-            searchCount,
-            exploreCount
-          )
-        );
+        await reject("explore_parallel", `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done.`);
         continue;
       }
 
@@ -301,13 +303,9 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       }
 
       if (validBranches.length === 0) {
-        messages.push(
-          buildOrchestratorErrorMessage(
-            `No valid branches: all linkIds were missing on the current SERP or already explored.`,
-            searchCount,
-            exploreCount
-          )
-        );
+        await reject("explore_parallel", `No valid branches: all linkIds were missing on the current SERP or already explored.`, {
+          requestedLinkIds: rawBranches.map((b) => b?.linkId).filter((v): v is string => typeof v === "string"),
+        });
         continue;
       }
 
@@ -341,8 +339,8 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
       continue;
     }
 
-    // 알 수 없는 action — 에러 안내 후 다음 라운드에서 LLM이 재선택
-    messages.push(buildOrchestratorErrorMessage(`Unknown action "${action.action}".`, searchCount, exploreCount));
+    // 알 수 없는 action
+    await reject(String(action.action), `Unknown action "${action.action}".`);
   }
 
   // Step: 최종 답변 합성

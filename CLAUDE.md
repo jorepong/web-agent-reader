@@ -177,7 +177,8 @@ ISO 8601 타임스탬프 문자열 정렬 = 시간순 정렬을 활용해 finali
 
 - 새 파일은 기존 패턴 그대로 따름
 - 에러 처리: 탐색 에이전트는 크래시 없이 폴백 리포트 반환 (found: false, completeness: "none")
-- LLM 응답 JSON 파싱은 `parseJsonResponse`(`json-utils.ts`) 사용 — 코드펜스/주변 prose를 허용. JSON을 기대하는 호출은 `client.complete(..., { jsonResponse: true })`로 `response_format: json_object`를 강제.
+- LLM 액션 응답은 OpenAI Structured Outputs로 강제. `prompts.ts`의 `orchestratorActionSchema` / `explorerActionSchemaCanExplore` / `explorerActionSchemaTerminal`을 `client.complete(..., { responseSchema })`로 전달. 응답은 스키마에 부합하는 단일 JSON 객체로 보장됨.
+- 응답 텍스트 파싱은 여전히 `parseJsonResponse`(`json-utils.ts`)로 방어적으로 처리 — 스키마가 보장해도 mock 응답이나 예외 경로 대응. `jsonResponse: true` 옵션은 스키마 없이 자유 JSON을 받을 때만 사용.
 - 싱글톤/전역 상태 금지 — logger, client 인스턴스는 명시적으로 주입
 - 프롬프트 변경은 모두 `prompts.ts`에서만
 

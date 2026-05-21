@@ -69,8 +69,9 @@ function makeSerp(opts: {
 }
 
 // LLM action 응답을 손쉽게 만드는 헬퍼.
+// Structured Outputs 스키마가 응답을 { decision: <action> } 형태로 감싸므로 테스트도 동일하게 감싼다.
 function actionResponse(payload: unknown) {
-  return { text: JSON.stringify(payload), tokenUsage };
+  return { text: JSON.stringify({ decision: payload }), tokenUsage };
 }
 
 describe("runSearch (agentic orchestrator)", () => {

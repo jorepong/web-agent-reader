@@ -13,8 +13,10 @@ describe("buildExplorerInitialPrompt", () => {
     }, "T1 page content");
 
     expect(messages[0]?.content).toContain("You cannot explore further links.");
-    expect(messages[0]?.content).toContain('"completeness": "partial"');
-    expect(messages[0]?.content).toContain('"missingInfo": ["what is missing or which verification could not be performed"]');
+    // 스키마가 "complete"/"partial"/"none"를 강제하지만 프롬프트도 partial 선택을
+    // 명시적으로 가능한 옵션으로 다룸을 검증.
+    expect(messages[0]?.content).toContain("partial");
+    expect(messages[0]?.content).toContain("missingInfo");
     expect(messages[0]?.content).not.toContain("suggestedLinks");
   });
 });

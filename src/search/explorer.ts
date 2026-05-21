@@ -10,7 +10,14 @@ import { convertPage } from "../index.js";
 import { parseJsonResponse } from "./json-utils.js";
 import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
-import { buildExplorerContinueMessage, buildExplorerInitialPrompt, MAX_CHILD_CALLS_PER_AGENT, MAX_DEPTH } from "./prompts.js";
+import {
+  buildExplorerContinueMessage,
+  buildExplorerInitialPrompt,
+  explorerActionSchemaCanExplore,
+  explorerActionSchemaTerminal,
+  MAX_CHILD_CALLS_PER_AGENT,
+  MAX_DEPTH,
+} from "./prompts.js";
 import type { ExplorationReport, LLMMessage, MissionBrief, ReportCompleteness, TokenUsage } from "./types.js";
 
 export async function runExplorationAgent(
@@ -47,7 +54,15 @@ export async function runExplorationAgent(
     const MAX_ROUNDS = MAX_CHILD_CALLS_PER_AGENT + 2;
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
-      const { text, tokenUsage } = await client.complete(brief.agentId, messages, { jsonResponse: true });
+      // 라운드별 스키마 선택:
+      //   - 자식 호출 여유가 있고 깊이 한도 안에 있고 마지막 라운드도 아니면 → explore/done 모두 가능
+      //   - 그 외에는 done만 허용 (LLM이 explore를 시도하지 못하도록 schema에서 차단)
+      const isLastRound = round === MAX_ROUNDS - 1;
+      const canExploreNow =
+        !isLastRound && brief.depth < MAX_DEPTH && childCallCount < MAX_CHILD_CALLS_PER_AGENT;
+      const responseSchema = canExploreNow ? explorerActionSchemaCanExplore : explorerActionSchemaTerminal;
+
+      const { text, tokenUsage } = await client.complete(brief.agentId, messages, { responseSchema });
       totalTokenUsage = {
         promptTokens: totalTokenUsage.promptTokens + tokenUsage.promptTokens,
         completionTokens: totalTokenUsage.completionTokens + tokenUsage.completionTokens,
@@ -65,9 +80,9 @@ export async function runExplorationAgent(
         relevantExcerpts?: unknown;
         missingInfo?: unknown;
       };
-      // 관대한 JSON 파서: 코드펜스/주변 prose가 섞여도 첫 번째 JSON 블록을 추출.
-      const parsedOrNull = parseJsonResponse<ParsedAction>(text);
-      const parsed: ParsedAction = parsedOrNull ?? {
+      // 스키마가 { decision: <action> } 형태로 응답을 감싸므로 .decision 필드를 꺼낸다.
+      const wrapper = parseJsonResponse<{ decision?: ParsedAction }>(text);
+      const parsed: ParsedAction = wrapper?.decision ?? {
         action: "done",
         found: false,
         summary: "Failed to parse LLM response.",
@@ -91,14 +106,11 @@ export async function runExplorationAgent(
       }
 
       // action === "explore"
+      // 이 분기는 canExploreNow가 true일 때만 도달 가능 (schema가 explore를 차단함).
+      // 다만 schema 우회 가능성에 대비해 방어적으로 한 번 더 검사.
       const linkId = parsed.linkId;
       const entry = linkId ? result.links.links[linkId] : undefined;
-      // 마지막 라운드는 LLM이 done을 반환해야 하므로 자식 호출 불가
-      const isLastRound = round === MAX_ROUNDS - 1;
-      const canRunChild =
-        !isLastRound &&
-        brief.depth < MAX_DEPTH &&
-        childCallCount < MAX_CHILD_CALLS_PER_AGENT;
+      const canRunChild = canExploreNow;
 
       if (canRunChild && entry && !visitedUrls.has(entry.url)) {
         await logger.log("recursion_decision", brief.agentId, {

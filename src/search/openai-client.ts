@@ -17,24 +17,39 @@ export class OpenAIClient {
     this.logger = logger;
   }
 
-  // jsonResponse=true: 모델에 JSON 객체 응답을 강제. 호출부의 프롬프트에 "JSON"이 포함돼 있어야 함.
-  // 기본 false — 검색 쿼리 생성처럼 plain text를 반환하는 호출과 호환 유지.
+  // responseSchema: OpenAI Structured Outputs로 응답 형식 강제 (json_schema strict 모드).
+  //   - 응답이 스키마를 만족하지 못하면 API가 거부 → 파싱 실패 거의 0
+  //   - 호출부는 응답 텍스트를 그냥 JSON.parse 해도 안전 (스키마 검증 완료)
+  // 미제공 시: plain text 응답 (예: 최종 답변 합성).
   async complete(
     agentId: string,
     messages: LLMMessage[],
-    options: { jsonResponse?: boolean } = {}
+    options: { responseSchema?: { name: string; schema: unknown } } = {}
   ): Promise<{ text: string; tokenUsage: TokenUsage }> {
     // callId: 같은 에이전트가 여러 번 LLM을 호출할 때 로그에서 요청-응답 쌍을 구분하기 위한 식별자
     const callId = crypto.randomUUID();
 
     await this.logger.log("llm_request", agentId, { callId, messages });
 
+    const responseFormat = options.responseSchema
+      ? {
+          response_format: {
+            type: "json_schema" as const,
+            json_schema: {
+              name: options.responseSchema.name,
+              schema: options.responseSchema.schema as Record<string, unknown>,
+              strict: true,
+            },
+          },
+        }
+      : {};
+
     const response = await this.client.chat.completions.create({
       model: this.model,
       messages,
       // 일부 최신 추론 모델은 temperature를 기본값(1)으로만 허용하므로 명시 전달하지 않음
       reasoning_effort: "high",
-      ...(options.jsonResponse ? { response_format: { type: "json_object" as const } } : {}),
+      ...responseFormat,
     });
 
     const text = response.choices[0]?.message?.content;
