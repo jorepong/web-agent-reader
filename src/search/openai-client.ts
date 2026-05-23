@@ -29,7 +29,13 @@ export class OpenAIClient {
     // callId: 같은 에이전트가 여러 번 LLM을 호출할 때 로그에서 요청-응답 쌍을 구분하기 위한 식별자
     const callId = crypto.randomUUID();
 
-    await this.logger.log("llm_request", agentId, { callId, messages });
+    const requestMessages = messages.map((message) => ({ ...message }));
+    await this.logger.log("llm_request", agentId, {
+      callId,
+      messages: requestMessages,
+      responseSchemaName: options.responseSchema?.name ?? null,
+      structuredOutputs: Boolean(options.responseSchema),
+    });
 
     const responseFormat = options.responseSchema
       ? {
