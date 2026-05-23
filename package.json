@@ -5,7 +5,8 @@
   "type": "module",
   "bin": {
     "llm-page": "./dist/cli.js",
-    "llm-search": "./dist/search/cli.js"
+    "llm-search": "./dist/search/cli.js",
+    "llm-search-v2": "./dist/search/v2/cli.js"
   },
   "scripts": {
     "build": "tsc",
