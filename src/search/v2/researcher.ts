@@ -40,12 +40,23 @@ import {
   buildRootCoordinatorMessages,
   buildRootInitialDelegateSchema,
   buildRootSchema,
+  buildSectionSelectionMessages,
+  buildSectionSelectionSchema,
   buildSerpResultMessage,
   buildStartPageFirstSchema,
   buildSubInitialSchema,
   buildSubResearcherInitialMessages,
 } from "./prompts.js";
+import {
+  buildSectionedMarkdown,
+  defaultSectionIds,
+  formatSectionOutline,
+  selectSectionMarkdown,
+} from "./sections.js";
 import type { CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, ResearchOptions, SurfaceKind } from "./types.js";
+
+const SECTION_SELECTION_THRESHOLD_CHARS = 40_000;
+const MAX_SELECTED_PAGE_CHARS = 60_000;
 
 class CandidateRegistry {
   private nextId = 1;
@@ -107,6 +118,105 @@ function extractSerpSnippets(markdown: string, candidates: Record<string, Candid
     .trim();
 }
 
+function visibleCandidateIds(markdown: string): string[] {
+  return Array.from(new Set((markdown.match(/\[C\d+\]/g) ?? []).map((match) => match.slice(1, -1))));
+}
+
+function formatCandidateStatus(
+  candidates: Record<string, CandidateLink>,
+  candidateIds: string[],
+  visitedUrls: Set<string>,
+  maxRows = 40
+): string {
+  const rows = candidateIds
+    .map((id) => candidates[id])
+    .filter((candidate): candidate is CandidateLink => Boolean(candidate))
+    .slice(0, maxRows)
+    .map((candidate) => {
+      const status = visitedUrls.has(candidate.url) ? "already visited" : "available";
+      return `[${candidate.id}] ${status} — ${candidate.text} — ${candidate.url}`;
+    });
+  if (rows.length === 0) return "";
+  if (candidateIds.length > maxRows) rows.push(`... ${candidateIds.length - maxRows} more visible candidates omitted from status list`);
+  return rows.join("\n");
+}
+
+interface ParsedSectionSelection {
+  readWholePage?: boolean;
+  sectionIds?: string[];
+  rationale?: string;
+}
+
+async function preparePageReadMarkdown(
+  brief: ResearcherBrief,
+  result: ConvertResult,
+  candidates: Record<string, CandidateLink>,
+  client: OpenAIClient,
+  logger: V2Logger,
+  budget: SharedBudget
+): Promise<string> {
+  const rewritten = rewriteLinkIds(result.markdown, candidates);
+  if (rewritten.length <= SECTION_SELECTION_THRESHOLD_CHARS) return rewritten;
+
+  const sectioned = buildSectionedMarkdown(rewritten);
+  if (sectioned.sections.length <= 1) return rewritten;
+
+  const outline = formatSectionOutline(sectioned.sections);
+  await logger.log("page_sections", brief.agentId, {
+    url: brief.startUrl,
+    totalChars: rewritten.length,
+    sectionCount: sectioned.sections.length,
+    outline,
+  });
+
+  let selection: ParsedSectionSelection | undefined;
+  try {
+    const { text } = await client.complete(
+      brief.agentId,
+      buildSectionSelectionMessages(
+        brief.goal,
+        brief.parentGoal,
+        brief.startUrl ?? result.page.sourceUrl,
+        outline,
+        rewritten.length,
+        budget.limits.maxParallel
+      ),
+      { responseSchema: buildSectionSelectionSchema(), reasoningEffort: "low" }
+    );
+    selection = parseJsonResponse<{ selection?: ParsedSectionSelection }>(text)?.selection;
+  } catch (err) {
+    await logger.log("page_section_selection", brief.agentId, {
+      url: brief.startUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const validIds = new Set(sectioned.sections.map((section) => section.id));
+  const requestedIds = Array.isArray(selection?.sectionIds)
+    ? selection.sectionIds.filter((id) => typeof id === "string" && validIds.has(id))
+    : [];
+  const fallbackIds = requestedIds.length > 0 ? requestedIds : defaultSectionIds(sectioned);
+  const selected = selectSectionMarkdown(sectioned, fallbackIds, {
+    readWholePage: selection?.readWholePage === true,
+    maxChars: MAX_SELECTED_PAGE_CHARS,
+  });
+
+  await logger.log("page_section_selection", brief.agentId, {
+    url: brief.startUrl,
+    readWholePage: selection?.readWholePage === true,
+    requestedIds,
+    selectedIds: selected.selectedIds,
+    selectedChars: selected.markdown.length,
+    truncated: selected.truncated,
+    rationale: selection?.rationale,
+  });
+
+  return `Selected page sections from ${brief.startUrl ?? result.page.sourceUrl}.
+Unread sections may still contain relevant details; if coverage is incomplete, report the gap instead of inferring.
+
+${selected.markdown}`;
+}
+
 // 한 라운드 동안 LLM에 허용할 행동을 동적으로 결정.
 // budget 상태와 currentSurface / 깊이 한도에 따라 스키마를 좁힌다.
 function pickSchema(
@@ -116,27 +226,36 @@ function pickSchema(
   round: number,
   childCallCount: number
 ) {
+  const canDelegate =
+    budget.canRecurseDeeper(brief.depth) &&
+    budget.exploresUsed < budget.limits.maxExplores &&
+    childCallCount < budget.limits.maxChildCallsPerAgent;
+  const parallelLimit = Math.min(
+    budget.limits.maxParallel,
+    Math.max(0, budget.limits.maxChildCallsPerAgent - childCallCount),
+    budget.parallelSlotsRemaining()
+  );
+
   if (brief.parentAgentId === null) {
-    if (childCallCount === 0) return buildRootInitialDelegateSchema(budget.limits.maxParallel);
-    return buildRootSchema(budget.limits.maxParallel);
+    if (!canDelegate) return buildDoneOnlySchema();
+    if (childCallCount === 0) return buildRootInitialDelegateSchema(parallelLimit);
+    return buildRootSchema(parallelLimit);
   }
 
   const hasSurface = currentSurface !== null || brief.startUrl !== undefined;
   const canPaginate = currentSurface?.kind === "serp";
   const canSearch = budget.searchesUsed < budget.limits.maxSearches;
-  const canRecurse =
-    budget.canRecurseDeeper(brief.depth) && budget.exploresUsed < budget.limits.maxExplores;
 
   if (!hasSurface) {
     return buildSubInitialSchema();
   }
   if (brief.startUrl && round === 1) {
-    return canRecurse ? buildStartPageFirstSchema(budget.limits.maxParallel) : buildDoneOnlySchema();
+    return canDelegate ? buildStartPageFirstSchema(parallelLimit) : buildDoneOnlySchema();
   }
-  if (canSearch && canRecurse && canPaginate) return buildFullActionSchema(budget.limits.maxParallel);
-  if (canSearch && canRecurse && !canPaginate) return buildNoPaginateSchema(budget.limits.maxParallel);
-  if (canSearch && !canRecurse) return buildNoDelegateSchema(canPaginate);
-  if (!canSearch && canRecurse) return buildNoSearchSchema(budget.limits.maxParallel);
+  if (canSearch && canDelegate && canPaginate) return buildFullActionSchema(parallelLimit);
+  if (canSearch && canDelegate && !canPaginate) return buildNoPaginateSchema(parallelLimit);
+  if (canSearch && !canDelegate) return buildNoDelegateSchema(canPaginate);
+  if (!canSearch && canDelegate) return buildNoSearchSchema(parallelLimit);
   return buildDoneOnlySchema();
 }
 
@@ -292,12 +411,15 @@ export async function runResearcher(
         pageId: result.page.pageId,
       });
       const candidates = candidateRegistry.registerSurface(result, "page", brief.startUrl);
+      const pageReadMarkdown = await preparePageReadMarkdown(brief, result, candidates, client, logger, budget);
+      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(pageReadMarkdown), budget.visitedUrls);
       messages = buildChildInitialMessages(
         brief.goal,
         brief.parentGoal,
         brief.startUrl,
-        rewriteLinkIds(result.markdown, candidates),
-        budget.limits.maxParallel
+        pageReadMarkdown,
+        budget.limits.maxParallel,
+        candidateStatus
       );
       // 자식의 시작 페이지를 currentSurface로 둔다 → 페이지의 [C*] 후보를 delegate할 때 동일 메커니즘 사용.
       // 검색 결과가 아니라 일반 페이지지만, links 레지스트리는 같은 형태라 그대로 활용 가능.
@@ -403,9 +525,10 @@ export async function runResearcher(
 
       const candidates = candidateRegistry.registerSurface(result, "serp", url);
       const snippets = extractSerpSnippets(result.markdown, candidates, true);
+      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(snippets), budget.visitedUrls);
       currentSurface = { kind: "serp", engine, query, page, url, result, candidates };
       await logger.log("page_markdown", brief.agentId, { url, markdown: result.markdown, pageId });
-      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary()));
+      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary(), candidateStatus));
       continue;
     }
 
@@ -450,9 +573,10 @@ export async function runResearcher(
 
       const candidates = candidateRegistry.registerSurface(result, "serp", url);
       const snippets = extractSerpSnippets(result.markdown, candidates, true);
+      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(snippets), budget.visitedUrls);
       currentSurface = { kind: "serp", engine, query, page, url, result, candidates };
       await logger.log("page_markdown", brief.agentId, { url, markdown: result.markdown, pageId });
-      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary()));
+      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary(), candidateStatus));
       continue;
     }
 

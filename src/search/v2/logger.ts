@@ -119,6 +119,16 @@ export class V2Logger extends DebugLogger {
         process.stderr.write(`${tag} 페이지 변환 완료: ${p["url"]} (${md.length}자)\n`);
         break;
       }
+      case "page_sections": {
+        process.stderr.write(`${tag} 페이지 섹션 인덱스 생성: ${p["url"]} (${p["sectionCount"]}개, ${p["totalChars"]}자)\n`);
+        break;
+      }
+      case "page_section_selection": {
+        const selected = Array.isArray(p["selectedIds"]) ? p["selectedIds"].join(", ") : "";
+        const suffix = selected ? ` → ${selected}` : "";
+        process.stderr.write(`${tag} 페이지 섹션 선택${suffix} (${p["selectedChars"] ?? 0}자)\n`);
+        break;
+      }
       case "llm_request": {
         const msgs = (p["messages"] as unknown[]) ?? [];
         const schemaName = p["responseSchemaName"];

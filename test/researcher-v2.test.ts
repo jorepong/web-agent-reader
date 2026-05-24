@@ -18,8 +18,12 @@ function response(decision: unknown) {
 function makeResult(url: string, links: ConvertResult["links"]["links"] = {}): ConvertResult {
   const lines = ["# Page", "", "## Main Content", ""];
   for (const id of Object.keys(links)) lines.push(`${links[id]!.text} [${id}]`);
+  return makeMarkdownResult(url, lines.join("\n"), links);
+}
+
+function makeMarkdownResult(url: string, markdown: string, links: ConvertResult["links"]["links"] = {}): ConvertResult {
   return {
-    markdown: lines.join("\n"),
+    markdown,
     links: { pageId: "P", sourceUrl: url, links },
     page: {
       pageId: "P",
@@ -83,6 +87,32 @@ describe("Researcher v2 delegation model", () => {
     expect(schemaNames).not.toContain("researcher-root:researcher_action_sub_initial");
   });
 
+  it("forces root synthesis when delegate budget is exhausted", async () => {
+    const schemaNames: string[] = [];
+    const client = {
+      complete: vi.fn(async (agentId: string, _messages: unknown[], options: { responseSchema?: { name: string } }) => {
+        schemaNames.push(`${agentId}:${options.responseSchema?.name ?? "none"}`);
+        return response({
+          action: "done",
+          answer: "ANSWER:\nNo delegate budget remains.\n\nSOURCES:\n(none)\n\nCOVERAGE: none\n\nGAPS:\n- No child researcher budget\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root",
+      parentAgentId: null,
+      goal: "question",
+      parentGoal: "question",
+      depth: 0,
+    };
+
+    const answer = await runResearcher(brief, client as never, logger as never, new SharedBudget({ maxExplores: 0 }));
+
+    expect(answer).toContain("No delegate budget remains");
+    expect(schemaNames[0]).toBe("researcher-root:researcher_action_done_only");
+  });
+
   it("blocks search on the first round when a sub-researcher starts from a URL", async () => {
     vi.mocked(convertPage).mockResolvedValue(makeResult("https://example.com/page"));
 
@@ -141,6 +171,61 @@ describe("Researcher v2 delegation model", () => {
     expect(answer).toContain("Read what is available");
     expect(schemaNames[0]).toBe("researcher-root-d3:researcher_action_done_only");
     expect(schemaNames[0]).not.toContain("researcher_action_no_delegate");
+  });
+
+  it("asks which sections to read before sending a long starting page", async () => {
+    const longMarkdown = [
+      "# Page",
+      "",
+      "## Navigation",
+      "Home",
+      "",
+      "## Main Content",
+      "",
+      "### Needed section",
+      "Important roster fact.",
+      "",
+      "### Unneeded section",
+      `UNNEEDED-FILLER ${"x".repeat(45_000)}`,
+    ].join("\n");
+    vi.mocked(convertPage).mockResolvedValue(makeMarkdownResult("https://example.com/long", longMarkdown));
+
+    const schemaNames: string[] = [];
+    let sectionPrompt = "";
+    let pageReadPrompt = "";
+    const client = {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string }; reasoningEffort?: string }) => {
+        schemaNames.push(options.responseSchema?.name ?? "none");
+        if (options.responseSchema?.name === "researcher_page_section_selection") {
+          expect(options.reasoningEffort).toBe("low");
+          sectionPrompt = messages.map((message) => message.content).join("\n");
+          return { text: JSON.stringify({ selection: { readWholePage: false, sectionIds: ["S4"], rationale: "Needed section matches the goal." } }), tokenUsage };
+        }
+        pageReadPrompt = messages.map((message) => message.content).join("\n");
+        return response({
+          action: "done",
+          answer: "ANSWER:\nImportant roster fact.\n\nSOURCES:\n- https://example.com/long\n\nCOVERAGE: complete\n\nGAPS:\n(none)\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root-long",
+      parentAgentId: "researcher-root",
+      goal: "Find the roster fact.",
+      parentGoal: "question",
+      startUrl: "https://example.com/long",
+      depth: 1,
+    };
+
+    const answer = await runResearcher(brief, client as never, logger as never, new SharedBudget());
+
+    expect(answer).toContain("Important roster fact");
+    expect(schemaNames[0]).toBe("researcher_page_section_selection");
+    expect(schemaNames[1]).toBe("researcher_action_start_page_first");
+    expect(sectionPrompt).toContain("[S4] Main Content > Needed section");
+    expect(pageReadPrompt).toContain("Important roster fact");
+    expect(pageReadPrompt).not.toContain("UNNEEDED-FILLER");
   });
 
   it("rejects delegate_parallel when filtering leaves only one valid branch", async () => {
@@ -247,5 +332,44 @@ describe("Researcher v2 delegation model", () => {
         url: "https://example.com/first",
       }),
     );
+  });
+
+  it("shows already visited status for visible SERP candidates", async () => {
+    vi.mocked(convertPage).mockResolvedValue(
+      makeResult("https://www.google.com/search?q=x", {
+        L1: { id: "L1", text: "Visited candidate", url: "https://example.com/visited", kind: "external", sourcePath: "a" },
+        L2: { id: "L2", text: "Fresh candidate", url: "https://example.com/fresh", kind: "external", sourcePath: "b" },
+      }),
+    );
+
+    let serpPrompt = "";
+    const client = {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string } }) => {
+        if (options.responseSchema?.name === "researcher_action_sub_initial") {
+          return response({ action: "search", engine: "google", query: "x", rationale: "start" });
+        }
+        serpPrompt = messages.map((message) => message.content).join("\n");
+        return response({
+          action: "done",
+          answer: "ANSWER:\nStopped.\n\nSOURCES:\nSERP only — pages not verified\n\nCOVERAGE: partial\n\nGAPS:\n- Not delegated\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root-d1",
+      parentAgentId: "researcher-root",
+      goal: "Find sources.",
+      parentGoal: "question",
+      depth: 1,
+    };
+    const budget = new SharedBudget();
+    budget.visitedUrls.add("https://example.com/visited");
+
+    await runResearcher(brief, client as never, logger as never, budget);
+
+    expect(serpPrompt).toContain("[C1] already visited");
+    expect(serpPrompt).toContain("[C2] available");
+    expect(serpPrompt).toContain("Do not delegate candidates marked \"already visited\"");
   });
 });

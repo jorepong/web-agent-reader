@@ -62,6 +62,8 @@ export type LogEventKind =
   | "llm_request"
   | "llm_response"
   | "page_markdown"
+  | "page_sections"
+  | "page_section_selection"
   | "orchestrator_plan"
   | "final_answer"
   | "recursion_decision";

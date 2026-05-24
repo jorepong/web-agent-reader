@@ -91,6 +91,10 @@ function buildActionDelegateParallel(maxParallel: number) {
   } as const;
 }
 
+function delegateActions(maxParallel: number) {
+  return maxParallel >= 2 ? [actionDelegate, buildActionDelegateParallel(maxParallel)] : [actionDelegate];
+}
+
 // done의 answer는 자연어 답변 (외부/부모 모두에게 동일한 형태).
 // 템플릿 강제(ANSWER/SOURCES/COVERAGE/GAPS)는 프롬프트로 안내하고 스키마에서는 string만 강제.
 const actionDone = {
@@ -107,6 +111,39 @@ const actionDone = {
   additionalProperties: false,
 } as const;
 
+export function buildSectionSelectionSchema() {
+  return {
+    name: "researcher_page_section_selection",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        selection: {
+          type: "object",
+          properties: {
+            readWholePage: {
+              type: "boolean",
+              description: "Set true only when the whole page is necessary for this goal.",
+            },
+            sectionIds: {
+              type: "array",
+              minItems: 0,
+              maxItems: 8,
+              items: { type: "string" },
+              description: "Section IDs such as S3 to read. Use multiple IDs when needed.",
+            },
+            rationale: { type: "string" },
+          },
+          required: ["readWholePage", "sectionIds", "rationale"],
+          additionalProperties: false,
+        },
+      },
+      required: ["selection"],
+      additionalProperties: false,
+    },
+  } as const;
+}
+
 // 루트는 직접 검색/페이지 열람을 하지 않는다. 자연어 작업을 하위 리서처에게 위임하거나,
 // 이미 충분한 보고가 쌓였을 때만 done 한다.
 export function buildRootSchema(maxParallel: number) {
@@ -116,7 +153,7 @@ export function buildRootSchema(maxParallel: number) {
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionDelegate, buildActionDelegateParallel(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -131,7 +168,7 @@ export function buildRootInitialDelegateSchema(maxParallel: number) {
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionDelegate, buildActionDelegateParallel(maxParallel)] },
+        decision: { anyOf: delegateActions(maxParallel) },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -162,7 +199,7 @@ export function buildFullActionSchema(maxParallel: number) {
       type: "object",
       properties: {
         decision: {
-          anyOf: [actionSearch, actionPaginate, actionDelegate, buildActionDelegateParallel(maxParallel), actionDone],
+          anyOf: [actionSearch, actionPaginate, ...delegateActions(maxParallel), actionDone],
         },
       },
       required: ["decision"],
@@ -179,7 +216,7 @@ export function buildNoPaginateSchema(maxParallel: number) {
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionSearch, actionDelegate, buildActionDelegateParallel(maxParallel), actionDone] },
+        decision: { anyOf: [actionSearch, ...delegateActions(maxParallel), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -211,7 +248,7 @@ export function buildNoSearchSchema(maxParallel: number) {
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionDelegate, buildActionDelegateParallel(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -228,7 +265,7 @@ export function buildStartPageFirstSchema(maxParallel: number) {
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionDelegate, buildActionDelegateParallel(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -388,8 +425,12 @@ export function buildChildInitialMessages(
   parentGoal: string,
   startUrl: string,
   pageMarkdown: string,
-  maxParallel: number
+  maxParallel: number,
+  candidateStatus: string
 ): LLMMessage[] {
+  const statusBlock = candidateStatus
+    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, search later if allowed, or done.`
+    : "";
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
@@ -407,7 +448,35 @@ Your first action MUST analyze THIS PAGE:
 - Do NOT choose search as your first action. Your parent dispatched you here because this page (and pages linked from it) is the right starting point. Only consider search after you have established that this page and its links cannot lead to the answer.
 
 Page content:
-${pageMarkdown}`,
+${pageMarkdown}${statusBlock}`,
+    },
+  ];
+}
+
+export function buildSectionSelectionMessages(
+  goal: string,
+  parentGoal: string,
+  startUrl: string,
+  outline: string,
+  totalChars: number,
+  maxParallel: number
+): LLMMessage[] {
+  return [
+    { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
+    {
+      role: "user",
+      content: `Goal: ${goal}
+Original user question: ${parentGoal}
+Starting URL: ${startUrl}
+
+The starting page is large (${totalChars} characters), so you will first choose which sections to read. This section-selection step is part of the same page-read operation.
+
+Choose the smallest set of sections likely to answer the goal. You may choose multiple sections. Prefer specific child sections over huge parent sections when the outline shows them. Choose readWholePage=true only when the goal truly requires the full page and section targeting is unsafe.
+
+Include navigation/header/footer sections only when the task requires finding links, menus, pagination, or site navigation.
+
+Section outline:
+${outline}`,
     },
   ];
 }
@@ -418,13 +487,17 @@ export function buildSerpResultMessage(
   query: string,
   page: number,
   serpSnippets: string,
-  budgetSummary: string
+  budgetSummary: string,
+  candidateStatus: string
 ): LLMMessage {
   const body = serpSnippets.trim() || "(no usable results found on this page)";
+  const statusBlock = candidateStatus
+    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, reformulate search, paginate when useful, or done.`
+    : "";
   return {
     role: "user",
     content: `[SERP — engine=${engine}, query="${query}", page=${page}]
-${body}
+${body}${statusBlock}
 
 (${budgetSummary})
 

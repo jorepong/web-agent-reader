@@ -6,6 +6,8 @@ import OpenAI from "openai";
 import type { DebugLogger } from "./logger.js";
 import type { LLMMessage, TokenUsage } from "./types.js";
 
+type ReasoningEffort = "low" | "medium" | "high";
+
 export class OpenAIClient {
   private client: OpenAI;
   private model: string;
@@ -24,7 +26,7 @@ export class OpenAIClient {
   async complete(
     agentId: string,
     messages: LLMMessage[],
-    options: { responseSchema?: { name: string; schema: unknown } } = {}
+    options: { responseSchema?: { name: string; schema: unknown }; reasoningEffort?: ReasoningEffort } = {}
   ): Promise<{ text: string; tokenUsage: TokenUsage }> {
     // callId: 같은 에이전트가 여러 번 LLM을 호출할 때 로그에서 요청-응답 쌍을 구분하기 위한 식별자
     const callId = crypto.randomUUID();
@@ -35,6 +37,7 @@ export class OpenAIClient {
       messages: requestMessages,
       responseSchemaName: options.responseSchema?.name ?? null,
       structuredOutputs: Boolean(options.responseSchema),
+      reasoningEffort: options.reasoningEffort ?? "high",
     });
 
     const responseFormat = options.responseSchema
@@ -54,7 +57,7 @@ export class OpenAIClient {
       model: this.model,
       messages,
       // 일부 최신 추론 모델은 temperature를 기본값(1)으로만 허용하므로 명시 전달하지 않음
-      reasoning_effort: "high",
+      reasoning_effort: options.reasoningEffort ?? "high",
       ...responseFormat,
     });
 
