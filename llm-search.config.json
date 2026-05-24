@@ -1,0 +1,21 @@
+{
+  "version": "v2",
+  "limits": {
+    "v1": {
+      "maxRounds": 12,
+      "maxSearches": 5,
+      "maxExplores": 5,
+      "maxParallel": 3,
+      "maxDepth": 2,
+      "maxChildCallsPerAgent": 3
+    },
+    "v2": {
+      "maxRounds": 30,
+      "maxSearches": 8,
+      "maxExplores": 10,
+      "maxParallel": 3,
+      "maxDepth": 3,
+      "maxChildCallsPerAgent": 3
+    }
+  }
+}

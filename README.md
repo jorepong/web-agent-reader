@@ -66,6 +66,9 @@ LLM이 자율적으로 웹을 탐색하여 질문에 답변합니다.
 
 ```bash
 node dist/search/cli.js --query "질문"
+node dist/search/cli.js --v1 --query "질문"
+node dist/search/cli.js --v2 --query "질문"
+node dist/search/v2/cli.js --query "질문"
 ```
 
 옵션:
@@ -74,9 +77,14 @@ node dist/search/cli.js --query "질문"
 |------|--------|------|
 | `--query <str>` | 필수 | 검색할 질문 |
 | `--model <str>` | `gpt-5.4-mini` | OpenAI 모델명 |
+| `--v1` / `--v2` | 설정 파일 값 | 사용할 검색 구조를 CLI에서 직접 지정 |
+| `--version <v1\|v2>` | 설정 파일 값 | 사용할 검색 구조를 CLI에서 직접 지정 |
+| `--config <path>` | `llm-search.config.json` | 검색 구조와 한도 설정 파일 |
 | `--debug` | — | 디버그 로그 저장 |
 | `--log-dir <dir>` | `.` | 로그 저장 경로 |
 | `--env <path>` | `.env` | 환경변수 파일 경로 |
+
+버전을 명시하지 않으면 프로젝트 루트의 `llm-search.config.json`에 있는 `version` 값을 사용합니다. 같은 파일에서 v1/v2의 `maxRounds`, `maxSearches`, `maxExplores`, `maxParallel`, `maxDepth`, `maxChildCallsPerAgent` 한도를 조정할 수 있습니다.
 
 OpenAI API 키가 필요합니다. 프로젝트 루트에 `.env` 파일을 생성하세요.
 

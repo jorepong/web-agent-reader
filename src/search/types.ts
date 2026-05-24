@@ -6,6 +6,16 @@ export interface SearchOptions {
   model: string;
   debug: boolean;
   logDir: string;
+  limits?: Partial<SearchLimits>;
+}
+
+export interface SearchLimits {
+  maxRounds: number;
+  maxSearches: number;
+  maxExplores: number;
+  maxParallel: number;
+  maxDepth: number;
+  maxChildCallsPerAgent: number;
 }
 
 // 상위 에이전트가 하위 에이전트에게 넘기는 임무 명세.

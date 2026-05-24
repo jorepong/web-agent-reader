@@ -23,16 +23,13 @@ import type { DebugLogger } from "./logger.js";
 import type { OpenAIClient } from "./openai-client.js";
 import {
   buildExploreResultMessage,
+  buildOrchestratorActionSchema,
   buildOrchestratorErrorMessage,
   buildOrchestratorInitialPrompt,
   buildParallelExploreResultMessage,
   buildSerpResultMessage,
   buildSynthesisPrompt,
-  MAX_PARALLEL,
-  ORCHESTRATOR_MAX_EXPLORES,
-  ORCHESTRATOR_MAX_ROUNDS,
-  ORCHESTRATOR_MAX_SEARCHES,
-  orchestratorActionSchema,
+  DEFAULT_SEARCH_LIMITS,
 } from "./prompts.js";
 import { buildSerpUrl, isSupportedEngine, type SearchEngine } from "./search-engines.js";
 import type { ConvertResult } from "../types.js";
@@ -86,9 +83,11 @@ interface ParsedAction {
 
 export async function runSearch(options: SearchOptions, client: OpenAIClient, logger: DebugLogger): Promise<string> {
   logger.startAgent("orchestrator", null);
+  const limits = { ...DEFAULT_SEARCH_LIMITS, ...options.limits };
+  const orchestratorActionSchema = buildOrchestratorActionSchema(limits.maxParallel);
 
   // append-only messages: 시스템 + 첫 user 메시지 이후 (assistant + user) 페어가 라운드마다 추가됨.
-  const messages: LLMMessage[] = buildOrchestratorInitialPrompt(options.query);
+  const messages: LLMMessage[] = buildOrchestratorInitialPrompt(options.query, limits);
 
   const reports: ExplorationReport[] = [];
   const exploredUrls: string[] = [];
@@ -99,7 +98,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
   let searchCount = 0;
   let exploreCount = 0;
 
-  for (let round = 1; round <= ORCHESTRATOR_MAX_ROUNDS; round++) {
+  for (let round = 1; round <= limits.maxRounds; round++) {
     // 거부 경로 공통 로깅 + 에러 메시지 주입.
     // 모든 거부(파싱 실패 / 무효 입력 / 한도 초과 / 이미 방문 / 알 수 없는 action)는
     // orchestrator_plan 이벤트로 남도록 통일 → 매 라운드의 결정이 디버그 로그에 흔적을 남긴다.
@@ -111,7 +110,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         reason,
         ...context,
       });
-      messages.push(buildOrchestratorErrorMessage(reason, searchCount, exploreCount));
+      messages.push(buildOrchestratorErrorMessage(reason, searchCount, exploreCount, limits));
     };
 
     const { text } = await client.complete("orchestrator", messages, { responseSchema: orchestratorActionSchema });
@@ -134,8 +133,8 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
     }
 
     if (action.action === "search" || action.action === "paginate") {
-      if (searchCount >= ORCHESTRATOR_MAX_SEARCHES) {
-        await reject(action.action, `Search/paginate limit (${ORCHESTRATOR_MAX_SEARCHES}) reached. Pick explore on existing SERP, or done.`);
+      if (searchCount >= limits.maxSearches) {
+        await reject(action.action, `Search/paginate limit (${limits.maxSearches}) reached. Pick explore on existing SERP, or done.`);
         continue;
       }
 
@@ -223,7 +222,7 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         pageId,
       });
 
-      messages.push(buildSerpResultMessage(engine, query, page, snippets, searchCount, exploreCount));
+      messages.push(buildSerpResultMessage(engine, query, page, snippets, searchCount, exploreCount, limits));
       continue;
     }
 
@@ -232,8 +231,8 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         await reject("explore", `explore requires a SERP. Use search first.`);
         continue;
       }
-      if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
-        await reject("explore", `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done with what you have.`);
+      if (exploreCount >= limits.maxExplores) {
+        await reject("explore", `Explorer dispatch limit (${limits.maxExplores}) reached. Return done with what you have.`);
         continue;
       }
       if (typeof action.linkId !== "string" || !action.linkId) {
@@ -271,9 +270,9 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         depth: 0,
       };
 
-      const report = await runExplorationAgent(brief, client, logger);
+      const report = await runExplorationAgent(brief, client, logger, new Set(), limits);
       reports.push(report);
-      messages.push(buildExploreResultMessage(report, searchCount, exploreCount));
+      messages.push(buildExploreResultMessage(report, searchCount, exploreCount, limits));
       continue;
     }
 
@@ -282,13 +281,13 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
         await reject("explore_parallel", `explore_parallel requires a SERP. Use search first.`);
         continue;
       }
-      if (exploreCount >= ORCHESTRATOR_MAX_EXPLORES) {
-        await reject("explore_parallel", `Explorer dispatch limit (${ORCHESTRATOR_MAX_EXPLORES}) reached. Return done.`);
+      if (exploreCount >= limits.maxExplores) {
+        await reject("explore_parallel", `Explorer dispatch limit (${limits.maxExplores}) reached. Return done.`);
         continue;
       }
 
-      const remainingBudget = ORCHESTRATOR_MAX_EXPLORES - exploreCount;
-      const limit = Math.min(MAX_PARALLEL, remainingBudget);
+      const remainingBudget = limits.maxExplores - exploreCount;
+      const limit = Math.min(limits.maxParallel, remainingBudget);
       const rawBranches = Array.isArray(action.branches) ? action.branches : [];
 
       const validBranches: Array<{ linkId: string; task?: string; rationale?: string; url: string }> = [];
@@ -331,11 +330,11 @@ export async function runSearch(options: SearchOptions, client: OpenAIClient, lo
             parentGoal: options.query,
             depth: 0,
           };
-          return runExplorationAgent(brief, client, logger);
+          return runExplorationAgent(brief, client, logger, new Set(), limits);
         })
       );
       reports.push(...parallelReports);
-      messages.push(buildParallelExploreResultMessage(parallelReports, searchCount, exploreCount));
+      messages.push(buildParallelExploreResultMessage(parallelReports, searchCount, exploreCount, limits));
       continue;
     }
 

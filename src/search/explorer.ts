@@ -13,12 +13,11 @@ import type { OpenAIClient } from "./openai-client.js";
 import {
   buildExplorerContinueMessage,
   buildExplorerInitialPrompt,
+  DEFAULT_SEARCH_LIMITS,
   explorerActionSchemaCanExplore,
   explorerActionSchemaTerminal,
-  MAX_CHILD_CALLS_PER_AGENT,
-  MAX_DEPTH,
 } from "./prompts.js";
-import type { ExplorationReport, LLMMessage, MissionBrief, ReportCompleteness, TokenUsage } from "./types.js";
+import type { ExplorationReport, LLMMessage, MissionBrief, ReportCompleteness, SearchLimits, TokenUsage } from "./types.js";
 
 export async function runExplorationAgent(
   brief: MissionBrief,
@@ -26,7 +25,8 @@ export async function runExplorationAgent(
   logger: DebugLogger,
   // visitedUrls: 재귀 트리 내 중복 방문 방지. 부모-자식-형제 모두 공유.
   // 오케스트레이터의 exploredUrls와는 별개 (오케스트레이터 레벨 중복은 orchestrator.ts에서 관리).
-  visitedUrls: Set<string> = new Set()
+  visitedUrls: Set<string> = new Set(),
+  limits: Pick<SearchLimits, "maxDepth" | "maxChildCallsPerAgent"> = DEFAULT_SEARCH_LIMITS
 ): Promise<ExplorationReport> {
   logger.startAgent(brief.agentId, brief.parentAgentId);
   await logger.log("mission_brief", brief.agentId, { brief });
@@ -45,13 +45,13 @@ export async function runExplorationAgent(
 
     // context append 원칙: messages 배열에 추가만 하고 재구성하지 않는다.
     // 자식 보고를 받을 때마다 배열 끝에 assistant + user 메시지를 push.
-    const messages: LLMMessage[] = buildExplorerInitialPrompt(brief, result.markdown);
+    const messages: LLMMessage[] = buildExplorerInitialPrompt(brief, result.markdown, limits);
 
     // 여러 LLM 호출의 토큰 사용량을 누산해 최종 보고에 포함
     let totalTokenUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     let childCallCount = 0;
-    // 루프 상한: MAX_CHILD_CALLS_PER_AGENT 번 자식 호출 + 1번 초기 + 1번 마지막 done
-    const MAX_ROUNDS = MAX_CHILD_CALLS_PER_AGENT + 2;
+    // 루프 상한: maxChildCallsPerAgent 번 자식 호출 + 1번 초기 + 1번 마지막 done
+    const MAX_ROUNDS = limits.maxChildCallsPerAgent + 2;
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
       // 라운드별 스키마 선택:
@@ -59,7 +59,7 @@ export async function runExplorationAgent(
       //   - 그 외에는 done만 허용 (LLM이 explore를 시도하지 못하도록 schema에서 차단)
       const isLastRound = round === MAX_ROUNDS - 1;
       const canExploreNow =
-        !isLastRound && brief.depth < MAX_DEPTH && childCallCount < MAX_CHILD_CALLS_PER_AGENT;
+        !isLastRound && brief.depth < limits.maxDepth && childCallCount < limits.maxChildCallsPerAgent;
       const responseSchema = canExploreNow ? explorerActionSchemaCanExplore : explorerActionSchemaTerminal;
 
       const { text, tokenUsage } = await client.complete(brief.agentId, messages, { responseSchema });
@@ -137,10 +137,10 @@ export async function runExplorationAgent(
           depth: brief.depth + 1,
         };
 
-        const childReport = await runExplorationAgent(childBrief, client, logger, visitedUrls);
+        const childReport = await runExplorationAgent(childBrief, client, logger, visitedUrls, limits);
 
         // 자식 보고를 context에 append (재구성 금지 — prefix cache 히트율 유지)
-        const canExploreMore = childCallCount < MAX_CHILD_CALLS_PER_AGENT && round + 1 < MAX_ROUNDS - 1;
+        const canExploreMore = childCallCount < limits.maxChildCallsPerAgent && round + 1 < MAX_ROUNDS - 1;
         messages.push({ role: "assistant", content: text });
         messages.push(buildExplorerContinueMessage(childReport, canExploreMore));
       } else {
@@ -148,7 +148,7 @@ export async function runExplorationAgent(
         const reason = isLastRound
           ? "최대 라운드 도달"
           : !canRunChild
-            ? brief.depth >= MAX_DEPTH
+            ? brief.depth >= limits.maxDepth
               ? "최대 깊이 도달"
               : "최대 자식 탐색 횟수 도달"
             : !entry

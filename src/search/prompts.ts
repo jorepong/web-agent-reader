@@ -1,6 +1,6 @@
 // 모든 LLM 프롬프트 템플릿을 한곳에서 관리.
 // 프롬프트 변경은 반드시 이 파일에서만 수행한다.
-import type { ExplorationReport, LLMMessage, MissionBrief } from "./types.js";
+import type { ExplorationReport, LLMMessage, MissionBrief, SearchLimits } from "./types.js";
 
 // 탐색 에이전트의 재귀 최대 깊이.
 // depth 0 에이전트는 자식을 만들 수 있고(depth 1), depth 1은 자식(depth 2)을 만들 수 있다.
@@ -30,6 +30,15 @@ export const ORCHESTRATOR_MAX_SEARCHES = 5;
 // explore + explore_parallel로 디스패치 가능한 누적 explorer 수의 상한.
 // (기존 MAX_PAGES와 동일한 의미 — Phase 4에서 오케스트레이터 내부로 이동)
 export const ORCHESTRATOR_MAX_EXPLORES = 5;
+
+export const DEFAULT_SEARCH_LIMITS: SearchLimits = {
+  maxRounds: ORCHESTRATOR_MAX_ROUNDS,
+  maxSearches: ORCHESTRATOR_MAX_SEARCHES,
+  maxExplores: ORCHESTRATOR_MAX_EXPLORES,
+  maxParallel: MAX_PARALLEL,
+  maxDepth: MAX_DEPTH,
+  maxChildCallsPerAgent: MAX_CHILD_CALLS_PER_AGENT,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JSON Schemas (OpenAI Structured Outputs / json_schema strict 모드)
@@ -147,30 +156,32 @@ const orchestratorActionExploreSingle = {
   additionalProperties: false,
 } as const;
 
-const orchestratorActionExploreParallel = {
-  type: "object",
-  properties: {
-    action: { type: "string", enum: ["explore_parallel"] },
-    branches: {
-      type: "array",
-      minItems: 2,
-      maxItems: MAX_PARALLEL,
-      items: {
-        type: "object",
-        properties: {
-          linkId: { type: "string" },
-          task: { type: "string" },
-          rationale: { type: "string" },
+function buildOrchestratorActionExploreParallel(maxParallel: number) {
+  return {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["explore_parallel"] },
+      branches: {
+        type: "array",
+        minItems: 2,
+        maxItems: Math.max(2, maxParallel),
+        items: {
+          type: "object",
+          properties: {
+            linkId: { type: "string" },
+            task: { type: "string" },
+            rationale: { type: "string" },
+          },
+          required: ["linkId", "task", "rationale"],
+          additionalProperties: false,
         },
-        required: ["linkId", "task", "rationale"],
-        additionalProperties: false,
       },
+      rationale: { type: "string", description: "Why these branches are independent" },
     },
-    rationale: { type: "string", description: "Why these branches are independent" },
-  },
-  required: ["action", "branches", "rationale"],
-  additionalProperties: false,
-} as const;
+    required: ["action", "branches", "rationale"],
+    additionalProperties: false,
+  } as const;
+}
 
 const orchestratorActionDone = {
   type: "object",
@@ -184,13 +195,14 @@ const orchestratorActionDone = {
 
 // 오케스트레이터의 매 라운드 행동.
 // 5종 중 정확히 하나. (루트는 wrapDecisionSchema 규약대로 { decision: ... } 형태로 감싸짐.)
-export const orchestratorActionSchema = wrapDecisionSchema("orchestrator_action", [
-  orchestratorActionSearch,
-  orchestratorActionPaginate,
-  orchestratorActionExploreSingle,
-  orchestratorActionExploreParallel,
-  orchestratorActionDone,
-]);
+export function buildOrchestratorActionSchema(maxParallel = MAX_PARALLEL) {
+  const branches: unknown[] = [orchestratorActionSearch, orchestratorActionPaginate, orchestratorActionExploreSingle];
+  if (maxParallel >= 2) branches.push(buildOrchestratorActionExploreParallel(maxParallel));
+  branches.push(orchestratorActionDone);
+  return wrapDecisionSchema("orchestrator_action", branches);
+}
+
+export const orchestratorActionSchema = buildOrchestratorActionSchema();
 
 // 오케스트레이터 에이전틱 루프의 초기 프롬프트.
 // 이 시스템 메시지와 첫 user 메시지 이후, 매 라운드의 action JSON(assistant)과
@@ -199,13 +211,18 @@ export const orchestratorActionSchema = wrapDecisionSchema("orchestrator_action"
 //
 // 어떤 행동(search/paginate/explore/explore_parallel/done)을 언제 할지는 LLM의 자율 판단.
 // 종료 조건도 LLM이 휴리스틱으로 결정 — 정보 충분 / 반복 실패 / 관련성 하락.
-export function buildOrchestratorInitialPrompt(userQuery: string): LLMMessage[] {
+export function buildOrchestratorInitialPrompt(userQuery: string, limits: SearchLimits = DEFAULT_SEARCH_LIMITS): LLMMessage[] {
+  const parallelActionLine =
+    limits.maxParallel >= 2
+      ? `4. explore_parallel — dispatch 2-${limits.maxParallel} sub-agents in parallel to independent linkIds from the current SERP.`
+      : `4. explore_parallel — unavailable in this run because maxParallel is ${limits.maxParallel}. Use explore instead.`;
+  const actionVariantCount = limits.maxParallel >= 2 ? "five" : "four";
   return [
     {
       role: "system",
       content: `You are a research orchestrator with full autonomy over the search process.
 
-You operate as an agentic loop. Each round you choose ONE action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the user's question, or until further search is clearly unproductive. Your response is constrained by a JSON schema — choose exactly one of the five action variants.
+You operate as an agentic loop. Each round you choose ONE action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the user's question, or until further search is clearly unproductive. Your response is constrained by a JSON schema — choose exactly one of the ${actionVariantCount} available action variants.
 
 Available actions:
 
@@ -219,7 +236,7 @@ Available actions:
 
 3. explore — dispatch a sub-agent to one linkId from the current SERP. The sub-agent treats the chosen URL as its starting point and may follow further links itself.
 
-4. explore_parallel — dispatch 2-${MAX_PARALLEL} sub-agents in parallel to independent linkIds from the current SERP.
+${parallelActionLine}
 
 5. done — terminate and synthesize the answer.
 
@@ -257,9 +274,9 @@ explore vs explore_parallel:
 - Do not parallel-dispatch redundant or duplicate sources.
 
 Hard limits (the system will inject a notice when a limit is hit; respond by switching strategy or returning done):
-- At most ${ORCHESTRATOR_MAX_ROUNDS} total actions.
-- At most ${ORCHESTRATOR_MAX_SEARCHES} search/paginate actions combined.
-- At most ${ORCHESTRATOR_MAX_EXPLORES} explorer dispatches (each branch of explore_parallel counts as one).
+- At most ${limits.maxRounds} total actions.
+- At most ${limits.maxSearches} search/paginate actions combined.
+- At most ${limits.maxExplores} explorer dispatches (each branch of explore_parallel counts as one).
 
 Important:
 - linkId must come from the most recent SERP shown above. Do not invent IDs.
@@ -288,7 +305,8 @@ export function buildSerpResultMessage(
   page: number,
   serpSnippets: string,
   searchesUsed: number,
-  exploresUsed: number
+  exploresUsed: number,
+  limits: SearchLimits = DEFAULT_SEARCH_LIMITS
 ): LLMMessage {
   const body = serpSnippets.trim() || "(no usable results found on this page)";
   return {
@@ -296,14 +314,19 @@ export function buildSerpResultMessage(
     content: `[SERP — engine=${engine}, query="${query}", page=${page}]
 ${body}
 
-(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+(searches used: ${searchesUsed}/${limits.maxSearches}, explorer dispatches used: ${exploresUsed}/${limits.maxExplores})
 
 Choose your next action.`,
   };
 }
 
 // 단일 explore 결과를 messages에 append할 user 메시지.
-export function buildExploreResultMessage(report: ExplorationReport, searchesUsed: number, exploresUsed: number): LLMMessage {
+export function buildExploreResultMessage(
+  report: ExplorationReport,
+  searchesUsed: number,
+  exploresUsed: number,
+  limits: SearchLimits = DEFAULT_SEARCH_LIMITS
+): LLMMessage {
   const excerptText =
     report.relevantExcerpts.length > 0
       ? `\nKey excerpts:\n${report.relevantExcerpts.map((e) => `  - ${e}`).join("\n")}`
@@ -316,7 +339,7 @@ completeness: ${report.completeness}
 summary: ${report.summary}${excerptText}
 missingInfo: ${report.missingInfo.length ? report.missingInfo.join("; ") : "None"}
 
-(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+(searches used: ${searchesUsed}/${limits.maxSearches}, explorer dispatches used: ${exploresUsed}/${limits.maxExplores})
 
 Choose your next action.`,
   };
@@ -326,7 +349,8 @@ Choose your next action.`,
 export function buildParallelExploreResultMessage(
   reports: ExplorationReport[],
   searchesUsed: number,
-  exploresUsed: number
+  exploresUsed: number,
+  limits: SearchLimits = DEFAULT_SEARCH_LIMITS
 ): LLMMessage {
   const body = reports
     .map((r, i) => {
@@ -342,7 +366,7 @@ export function buildParallelExploreResultMessage(
     content: `[parallel explore results — ${reports.length} branches]
 ${body}
 
-(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+(searches used: ${searchesUsed}/${limits.maxSearches}, explorer dispatches used: ${exploresUsed}/${limits.maxExplores})
 
 Choose your next action.`,
   };
@@ -350,12 +374,17 @@ Choose your next action.`,
 
 // 잘못된 액션(파싱 실패, 무효 linkId, 한도 초과 등)에 대한 안내 메시지.
 // LLM이 다음 라운드에서 다른 행동을 선택하도록 유도한다.
-export function buildOrchestratorErrorMessage(detail: string, searchesUsed: number, exploresUsed: number): LLMMessage {
+export function buildOrchestratorErrorMessage(
+  detail: string,
+  searchesUsed: number,
+  exploresUsed: number,
+  limits: SearchLimits = DEFAULT_SEARCH_LIMITS
+): LLMMessage {
   return {
     role: "user",
     content: `[action could not be executed] ${detail}
 
-(searches used: ${searchesUsed}/${ORCHESTRATOR_MAX_SEARCHES}, explorer dispatches used: ${exploresUsed}/${ORCHESTRATOR_MAX_EXPLORES})
+(searches used: ${searchesUsed}/${limits.maxSearches}, explorer dispatches used: ${exploresUsed}/${limits.maxExplores})
 
 Choose a different action.`,
   };
@@ -364,8 +393,12 @@ Choose a different action.`,
 // 탐색 에이전트 아젠틱 루프의 초기 프롬프트.
 // 페이지를 분석하고 explore / done 중 하나를 결정하도록 요청.
 // depth >= MAX_DEPTH: 더 이상 자식 호출 불가 → done만 허용하는 별도 시스템 메시지 사용.
-export function buildExplorerInitialPrompt(brief: MissionBrief, pageMarkdown: string): LLMMessage[] {
-  const canExplore = brief.depth < MAX_DEPTH;
+export function buildExplorerInitialPrompt(
+  brief: MissionBrief,
+  pageMarkdown: string,
+  limits: Pick<SearchLimits, "maxDepth" | "maxChildCallsPerAgent"> = DEFAULT_SEARCH_LIMITS
+): LLMMessage[] {
+  const canExplore = brief.depth < limits.maxDepth;
   // canExplore 분기에서는 본문(systemContent)의 done 게이트가 이 역할을 직접 수행한다.
   // 여기서는 자식 호출이 불가능한 경우(depth >= MAX_DEPTH)의 부가 룰만 남긴다.
   const linkDecisionRules = canExplore
@@ -390,7 +423,7 @@ ${linkDecisionRules}`;
 The given web page is your starting point. Your goal may be answerable from this page alone, or it may require following links on this page to other pages — you can dispatch a sub-agent to any linked page, and that sub-agent can in turn dispatch its own sub-agents. Treat link-following as a normal part of the mission, not a last resort.
 
 At each step, choose exactly one of these two options (they are equal choices — neither is the default):
-- explore: dispatch a sub-agent to a linked page on this page (you can do this up to ${MAX_CHILD_CALLS_PER_AGENT} times total during this mission)
+- explore: dispatch a sub-agent to a linked page on this page (you can do this up to ${limits.maxChildCallsPerAgent} times total during this mission)
 - done: stop and return your final report
 
 Choose \`done\` only when BOTH hold:
