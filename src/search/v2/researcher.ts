@@ -235,11 +235,12 @@ function pickSchema(
     Math.max(0, budget.limits.maxChildCallsPerAgent - childCallCount),
     budget.parallelSlotsRemaining()
   );
+  const candidateIds = currentSurface ? Object.keys(currentSurface.candidates) : [];
 
   if (brief.parentAgentId === null) {
     if (!canDelegate) return buildDoneOnlySchema();
-    if (childCallCount === 0) return buildRootInitialDelegateSchema(parallelLimit);
-    return buildRootSchema(parallelLimit);
+    if (childCallCount === 0) return buildRootInitialDelegateSchema(parallelLimit, candidateIds);
+    return buildRootSchema(parallelLimit, candidateIds);
   }
 
   const hasSurface = currentSurface !== null || brief.startUrl !== undefined;
@@ -250,13 +251,20 @@ function pickSchema(
     return buildSubInitialSchema();
   }
   if (brief.startUrl && round === 1) {
-    return canDelegate ? buildStartPageFirstSchema(parallelLimit) : buildDoneOnlySchema();
+    return canDelegate ? buildStartPageFirstSchema(parallelLimit, candidateIds) : buildDoneOnlySchema();
   }
-  if (canSearch && canDelegate && canPaginate) return buildFullActionSchema(parallelLimit);
-  if (canSearch && canDelegate && !canPaginate) return buildNoPaginateSchema(parallelLimit);
+  if (canSearch && canDelegate && canPaginate) return buildFullActionSchema(parallelLimit, candidateIds);
+  if (canSearch && canDelegate && !canPaginate) return buildNoPaginateSchema(parallelLimit, candidateIds);
   if (canSearch && !canDelegate) return buildNoDelegateSchema(canPaginate);
-  if (!canSearch && canDelegate) return buildNoSearchSchema(parallelLimit);
+  if (!canSearch && canDelegate) return buildNoSearchSchema(parallelLimit, candidateIds);
   return buildDoneOnlySchema();
+}
+
+function actionReasoningEffort(schemaName: string, currentSurface: CurrentSurface | null): "medium" | "high" {
+  if (schemaName === "researcher_action_root_initial_delegate") return "medium";
+  if (schemaName === "researcher_action_sub_initial") return "medium";
+  if (currentSurface?.kind === "serp") return "medium";
+  return "high";
 }
 
 // 한 라운드의 거부를 일관되게 로깅 + 메시지 주입.
@@ -460,7 +468,10 @@ export async function runResearcher(
     budget.consumeRound();
 
     const schema = pickSchema(brief, budget, currentSurface, round, childCallCount);
-    const { text } = await client.complete(brief.agentId, messages, { responseSchema: schema });
+    const { text } = await client.complete(brief.agentId, messages, {
+      responseSchema: schema,
+      reasoningEffort: actionReasoningEffort(schema.name, currentSurface),
+    });
 
     const wrapper = parseJsonResponse<{ decision?: ParsedAction }>(text);
     const action = wrapper?.decision;

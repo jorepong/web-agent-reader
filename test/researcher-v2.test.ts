@@ -38,6 +38,23 @@ function makeMarkdownResult(url: string, markdown: string, links: ConvertResult[
   };
 }
 
+function collectTargetIdEnums(value: unknown, enums: unknown[][] = []): unknown[][] {
+  if (!value || typeof value !== "object") return enums;
+  const record = value as Record<string, unknown>;
+  if (record["targetId"] && typeof record["targetId"] === "object") {
+    const target = record["targetId"] as Record<string, unknown>;
+    if (Array.isArray(target["enum"])) enums.push(target["enum"]);
+  }
+  for (const child of Object.values(record)) {
+    if (Array.isArray(child)) {
+      for (const item of child) collectTargetIdEnums(item, enums);
+    } else {
+      collectTargetIdEnums(child, enums);
+    }
+  }
+  return enums;
+}
+
 describe("Researcher v2 delegation model", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -288,12 +305,16 @@ describe("Researcher v2 delegation model", () => {
       .mockResolvedValueOnce(makeResult("https://example.com/first"));
 
     let sawCandidateId = false;
+    let actionSchema: unknown;
     const client = {
-      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string } }) => {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string; schema?: unknown }; reasoningEffort?: string }) => {
         if (options.responseSchema?.name === "researcher_action_sub_initial") {
+          expect(options.reasoningEffort).toBe("medium");
           return response({ action: "search", engine: "google", query: "x", rationale: "start" });
         }
         if (options.responseSchema?.name === "researcher_action") {
+          expect(options.reasoningEffort).toBe("medium");
+          actionSchema = options.responseSchema.schema;
           sawCandidateId = messages.some((message) => message.content.includes("[C1]"));
           return response({
             action: "delegate",
@@ -322,6 +343,9 @@ describe("Researcher v2 delegation model", () => {
     await runResearcher(brief, client as never, logger as never, new SharedBudget());
 
     expect(sawCandidateId).toBe(true);
+    const targetIdEnums = collectTargetIdEnums(actionSchema);
+    expect(targetIdEnums.some((values) => values.includes("C1"))).toBe(true);
+    expect(targetIdEnums.some((values) => values.includes("[C1]"))).toBe(false);
     expect(logger.log).toHaveBeenCalledWith(
       "orchestrator_plan",
       "researcher-root-d1",

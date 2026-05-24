@@ -39,30 +39,41 @@ const actionPaginate = {
   additionalProperties: false,
 } as const;
 
-const actionDelegate = {
-  type: "object",
-  properties: {
-    action: { type: "string", enum: ["delegate"] },
-    task: { type: "string", description: "Natural-language sub-goal for the child researcher" },
-    targetId: {
-      type: ["string", "null"],
-      description: "Candidate ID such as C12 from the current SERP/page, or null",
-    },
-    linkId: {
-      type: ["string", "null"],
-      description: "Deprecated. Use targetId instead. Keep null unless an older prompt explicitly requires linkId.",
-    },
-    startUrl: {
-      type: ["string", "null"],
-      description: "Explicit starting URL from prior reports, or null when the child should discover sources itself",
-    },
-    rationale: { type: "string" },
-  },
-  required: ["action", "task", "targetId", "linkId", "startUrl", "rationale"],
-  additionalProperties: false,
-} as const;
+function targetIdProperty(candidateIds: string[]) {
+  const allowed = [null, ...candidateIds] as Array<string | null>;
+  return {
+    type: ["string", "null"],
+    enum: allowed,
+    description:
+      candidateIds.length > 0
+        ? `Use one exact candidate ID from the current surface without brackets, for example C12 not [C12]. Use null when delegating by startUrl or task only.`
+        : "No current candidate IDs are available. Use null.",
+  } as const;
+}
 
-function buildActionDelegateParallel(maxParallel: number) {
+function buildActionDelegate(candidateIds: string[] = []) {
+  return {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["delegate"] },
+      task: { type: "string", description: "Natural-language sub-goal for the child researcher" },
+      targetId: targetIdProperty(candidateIds),
+      linkId: {
+        type: ["string", "null"],
+        description: "Deprecated. Use targetId instead. Keep null unless an older prompt explicitly requires linkId.",
+      },
+      startUrl: {
+        type: ["string", "null"],
+        description: "Explicit starting URL from prior reports, or null when the child should discover sources itself",
+      },
+      rationale: { type: "string" },
+    },
+    required: ["action", "task", "targetId", "linkId", "startUrl", "rationale"],
+    additionalProperties: false,
+  } as const;
+}
+
+function buildActionDelegateParallel(maxParallel: number, candidateIds: string[] = []) {
   return {
     type: "object",
     properties: {
@@ -75,7 +86,7 @@ function buildActionDelegateParallel(maxParallel: number) {
           type: "object",
           properties: {
             task: { type: "string" },
-            targetId: { type: ["string", "null"] },
+            targetId: targetIdProperty(candidateIds),
             linkId: { type: ["string", "null"] },
             startUrl: { type: ["string", "null"] },
             rationale: { type: "string" },
@@ -91,8 +102,9 @@ function buildActionDelegateParallel(maxParallel: number) {
   } as const;
 }
 
-function delegateActions(maxParallel: number) {
-  return maxParallel >= 2 ? [actionDelegate, buildActionDelegateParallel(maxParallel)] : [actionDelegate];
+function delegateActions(maxParallel: number, candidateIds: string[] = []) {
+  const single = buildActionDelegate(candidateIds);
+  return maxParallel >= 2 ? [single, buildActionDelegateParallel(maxParallel, candidateIds)] : [single];
 }
 
 // done의 answer는 자연어 답변 (외부/부모 모두에게 동일한 형태).
@@ -146,14 +158,14 @@ export function buildSectionSelectionSchema() {
 
 // 루트는 직접 검색/페이지 열람을 하지 않는다. 자연어 작업을 하위 리서처에게 위임하거나,
 // 이미 충분한 보고가 쌓였을 때만 done 한다.
-export function buildRootSchema(maxParallel: number) {
+export function buildRootSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action_root",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -161,14 +173,14 @@ export function buildRootSchema(maxParallel: number) {
   } as const;
 }
 
-export function buildRootInitialDelegateSchema(maxParallel: number) {
+export function buildRootInitialDelegateSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action_root_initial_delegate",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: delegateActions(maxParallel) },
+        decision: { anyOf: delegateActions(maxParallel, candidateIds) },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -191,7 +203,7 @@ export function buildSubInitialSchema() {
 }
 
 // 일반 — 검색/페이지네이션/위임/완료 가능.
-export function buildFullActionSchema(maxParallel: number) {
+export function buildFullActionSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action",
     strict: true,
@@ -199,7 +211,7 @@ export function buildFullActionSchema(maxParallel: number) {
       type: "object",
       properties: {
         decision: {
-          anyOf: [actionSearch, actionPaginate, ...delegateActions(maxParallel), actionDone],
+          anyOf: [actionSearch, actionPaginate, ...delegateActions(maxParallel, candidateIds), actionDone],
         },
       },
       required: ["decision"],
@@ -209,14 +221,14 @@ export function buildFullActionSchema(maxParallel: number) {
 }
 
 // 페이지네이션 불가 — 현재 표면이 SERP가 아닐 때 사용.
-export function buildNoPaginateSchema(maxParallel: number) {
+export function buildNoPaginateSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action_no_paginate",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionSearch, ...delegateActions(maxParallel), actionDone] },
+        decision: { anyOf: [actionSearch, ...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -241,14 +253,14 @@ export function buildNoDelegateSchema(canPaginate: boolean) {
 }
 
 // 검색도 불가 — 현재 표면에서 위임과 완료만.
-export function buildNoSearchSchema(maxParallel: number) {
+export function buildNoSearchSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action_no_search",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -258,14 +270,14 @@ export function buildNoSearchSchema(maxParallel: number) {
 
 // 시작 페이지를 받은 서브 리서처의 첫 행동 — 페이지를 분석하고 done 또는 하위 위임만 가능.
 // 첫 라운드 search는 스키마로 차단한다.
-export function buildStartPageFirstSchema(maxParallel: number) {
+export function buildStartPageFirstSchema(maxParallel: number, candidateIds: string[] = []) {
   return {
     name: "researcher_action_start_page_first",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [...delegateActions(maxParallel), actionDone] },
+        decision: { anyOf: [...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
