@@ -4,6 +4,7 @@
 
 import type { ConvertResult } from "../../types.js";
 import type { SearchEngine } from "../search-engines.js";
+import type { SectionedMarkdown } from "./sections.js";
 
 // 외부 호출자가 사용하는 입력 옵션.
 // goal은 함수의 첫 인자로 분리. options는 모두 선택.
@@ -60,6 +61,12 @@ export interface CurrentSurface {
   url: string;
   result: ConvertResult;
   candidates: Record<string, CandidateLink>;
+  visibleCandidateIds: string[];
+  pageSections?: {
+    sectioned: SectionedMarkdown;
+    outline: string;
+    readSectionIds: string[];
+  };
 }
 
 export interface CandidateLink {

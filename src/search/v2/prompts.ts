@@ -39,6 +39,23 @@ const actionPaginate = {
   additionalProperties: false,
 } as const;
 
+const actionReadSections = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["read_sections"] },
+    sectionIds: {
+      type: "array",
+      minItems: 1,
+      maxItems: 8,
+      items: { type: "string" },
+      description: "Section IDs from the current page outline, such as S12.",
+    },
+    rationale: { type: "string", description: "Why these additional sections are needed before answering" },
+  },
+  required: ["action", "sectionIds", "rationale"],
+  additionalProperties: false,
+} as const;
+
 function targetIdProperty(candidateIds: string[]) {
   const allowed = [null, ...candidateIds] as Array<string | null>;
   return {
@@ -203,7 +220,8 @@ export function buildSubInitialSchema() {
 }
 
 // 일반 — 검색/페이지네이션/위임/완료 가능.
-export function buildFullActionSchema(maxParallel: number, candidateIds: string[] = []) {
+export function buildFullActionSchema(maxParallel: number, candidateIds: string[] = [], canReadSections = false) {
+  const localActions = canReadSections ? [actionReadSections] : [];
   return {
     name: "researcher_action",
     strict: true,
@@ -211,7 +229,7 @@ export function buildFullActionSchema(maxParallel: number, candidateIds: string[
       type: "object",
       properties: {
         decision: {
-          anyOf: [actionSearch, actionPaginate, ...delegateActions(maxParallel, candidateIds), actionDone],
+          anyOf: [actionSearch, actionPaginate, ...localActions, ...delegateActions(maxParallel, candidateIds), actionDone],
         },
       },
       required: ["decision"],
@@ -221,14 +239,15 @@ export function buildFullActionSchema(maxParallel: number, candidateIds: string[
 }
 
 // 페이지네이션 불가 — 현재 표면이 SERP가 아닐 때 사용.
-export function buildNoPaginateSchema(maxParallel: number, candidateIds: string[] = []) {
+export function buildNoPaginateSchema(maxParallel: number, candidateIds: string[] = [], canReadSections = false) {
+  const localActions = canReadSections ? [actionReadSections] : [];
   return {
     name: "researcher_action_no_paginate",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [actionSearch, ...delegateActions(maxParallel, candidateIds), actionDone] },
+        decision: { anyOf: [actionSearch, ...localActions, ...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -237,14 +256,15 @@ export function buildNoPaginateSchema(maxParallel: number, candidateIds: string[
 }
 
 // 위임 불가 (깊이 한도 또는 budget 소진) — delegate/delegate_parallel 제외.
-export function buildNoDelegateSchema(canPaginate: boolean) {
+export function buildNoDelegateSchema(canPaginate: boolean, canReadSections = false) {
+  const localActions = canReadSections ? [actionReadSections] : [];
   return {
     name: "researcher_action_no_delegate",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: canPaginate ? [actionSearch, actionPaginate, actionDone] : [actionSearch, actionDone] },
+        decision: { anyOf: canPaginate ? [actionSearch, actionPaginate, ...localActions, actionDone] : [actionSearch, ...localActions, actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -253,14 +273,15 @@ export function buildNoDelegateSchema(canPaginate: boolean) {
 }
 
 // 검색도 불가 — 현재 표면에서 위임과 완료만.
-export function buildNoSearchSchema(maxParallel: number, candidateIds: string[] = []) {
+export function buildNoSearchSchema(maxParallel: number, candidateIds: string[] = [], canReadSections = false) {
+  const localActions = canReadSections ? [actionReadSections] : [];
   return {
     name: "researcher_action_no_search",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [...delegateActions(maxParallel, candidateIds), actionDone] },
+        decision: { anyOf: [...localActions, ...delegateActions(maxParallel, candidateIds), actionDone] },
       },
       required: ["decision"],
       additionalProperties: false,
@@ -270,15 +291,29 @@ export function buildNoSearchSchema(maxParallel: number, candidateIds: string[] 
 
 // 시작 페이지를 받은 서브 리서처의 첫 행동 — 페이지를 분석하고 done 또는 하위 위임만 가능.
 // 첫 라운드 search는 스키마로 차단한다.
-export function buildStartPageFirstSchema(maxParallel: number, candidateIds: string[] = []) {
+export function buildStartPageFirstSchema(maxParallel: number, candidateIds: string[] = [], canReadSections = false) {
+  const localActions = canReadSections ? [actionReadSections] : [];
   return {
     name: "researcher_action_start_page_first",
     strict: true,
     schema: {
       type: "object",
       properties: {
-        decision: { anyOf: [...delegateActions(maxParallel, candidateIds), actionDone] },
+        decision: { anyOf: [...localActions, ...delegateActions(maxParallel, candidateIds), actionDone] },
       },
+      required: ["decision"],
+      additionalProperties: false,
+    },
+  } as const;
+}
+
+export function buildReadSectionsOrDoneSchema() {
+  return {
+    name: "researcher_action_read_sections_only",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: { decision: { anyOf: [actionReadSections, actionDone] } },
       required: ["decision"],
       additionalProperties: false,
     },
@@ -379,9 +414,10 @@ Available actions (subject to per-round constraints — the schema will only all
 
 1. search — fetch a fresh search-engine results page (SERP). Available to sub-Researchers, not the root.
 2. paginate — move to a different page of the CURRENT SERP.
-3. delegate — dispatch a sub-Researcher with a natural-language task. Optionally provide a targetId from the current surface or an explicit startUrl from prior reports.
-4. delegate_parallel — dispatch 2-${maxParallel} sub-Researchers in parallel to independent tasks.
-5. done — terminate with your final natural-language answer.
+3. read_sections — read additional sections from the CURRENT page when the previous page section read was not enough.
+4. delegate — dispatch a sub-Researcher with a natural-language task. Optionally provide a targetId from the current surface or an explicit startUrl from prior reports.
+5. delegate_parallel — dispatch 2-${maxParallel} sub-Researchers in parallel to independent tasks.
+6. done — terminate with your final natural-language answer.
 
 ${policyGuards(maxParallel)}
 
@@ -390,6 +426,7 @@ ${ANSWER_TEMPLATE}
 Important:
 - targetId in delegate/delegate_parallel MUST be a candidate ID like [C12] from the most recent SERP or page result shown above. Do not invent IDs. Do not use stale candidate IDs from earlier SERPs.
 - linkId is deprecated; keep it null unless the current message explicitly shows old-style [L*] IDs.
+- read_sections is only for the current page whose section outline was shown. Use section IDs exactly as shown, such as S12.
 - startUrl in delegate/delegate_parallel may be an explicit URL that appeared in a previous child report; use null if the child should discover sources itself.
 - task in delegate/delegate_parallel is the child's natural-language input. It should be self-contained and expressed in terms of the user's overall goal.
 - Once you return done, this branch is locked — you cannot revisit. Make sure the verification gates are satisfied first.`;
@@ -438,10 +475,14 @@ export function buildChildInitialMessages(
   startUrl: string,
   pageMarkdown: string,
   maxParallel: number,
-  candidateStatus: string
+  candidateStatus: string,
+  sectionOutline?: string
 ): LLMMessage[] {
   const statusBlock = candidateStatus
     ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, search later if allowed, or done.`
+    : "";
+  const sectionBlock = sectionOutline
+    ? `\n\nCurrent page section outline:\n${sectionOutline}\nIf the provided page content is insufficient, choose read_sections with additional section IDs from this outline before searching or delegating away.`
     : "";
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
@@ -460,7 +501,7 @@ Your first action MUST analyze THIS PAGE:
 - Do NOT choose search as your first action. Your parent dispatched you here because this page (and pages linked from it) is the right starting point. Only consider search after you have established that this page and its links cannot lead to the answer.
 
 Page content:
-${pageMarkdown}${statusBlock}`,
+${pageMarkdown}${sectionBlock}${statusBlock}`,
     },
   ];
 }
@@ -510,6 +551,33 @@ export function buildSerpResultMessage(
     role: "user",
     content: `[SERP — engine=${engine}, query="${query}", page=${page}]
 ${body}${statusBlock}
+
+(${budgetSummary})
+
+Choose your next action.`,
+  };
+}
+
+export function buildPageSectionReadResultMessage(
+  startUrl: string,
+  selectedIds: string[],
+  sectionMarkdown: string,
+  sectionOutline: string,
+  budgetSummary: string,
+  candidateStatus: string
+): LLMMessage {
+  const statusBlock = candidateStatus
+    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, read more sections if needed, search later if allowed, or done.`
+    : "";
+  return {
+    role: "user",
+    content: `[Additional page sections — ${startUrl}]
+selected: ${selectedIds.length ? selectedIds.join(", ") : "(fallback)"}
+
+${sectionMarkdown}
+
+Current page section outline:
+${sectionOutline}${statusBlock}
 
 (${budgetSummary})
 

@@ -245,6 +245,68 @@ describe("Researcher v2 delegation model", () => {
     expect(pageReadPrompt).not.toContain("UNNEEDED-FILLER");
   });
 
+  it("can read additional sections from the same starting page before answering", async () => {
+    const longMarkdown = [
+      "# Page",
+      "",
+      "## Navigation",
+      "Home",
+      "",
+      "## Main Content",
+      "",
+      "### Initial section",
+      "Initial roster fact.",
+      "",
+      "### Additional section",
+      "Additional roster detail.",
+      "",
+      "### Filler section",
+      `FILLER ${"x".repeat(45_000)}`,
+    ].join("\n");
+    vi.mocked(convertPage).mockResolvedValue(makeMarkdownResult("https://example.com/sectioned", longMarkdown));
+
+    const schemaNames: string[] = [];
+    let sawAdditionalSection = false;
+    const client = {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string } }) => {
+        schemaNames.push(options.responseSchema?.name ?? "none");
+        const allMessages = messages.map((message) => message.content).join("\n");
+        if (options.responseSchema?.name === "researcher_page_section_selection") {
+          return { text: JSON.stringify({ selection: { readWholePage: false, sectionIds: ["S4"], rationale: "Start with the initial section." } }), tokenUsage };
+        }
+        if (options.responseSchema?.name === "researcher_action_start_page_first") {
+          expect(allMessages).toContain("Current page section outline");
+          return response({ action: "read_sections", sectionIds: ["S5"], rationale: "Need the adjacent detail section before answering." });
+        }
+        sawAdditionalSection = allMessages.includes("Additional roster detail.");
+        return response({
+          action: "done",
+          answer: "ANSWER:\nInitial and additional facts.\n\nSOURCES:\n- https://example.com/sectioned\n\nCOVERAGE: complete\n\nGAPS:\n(none)\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root-sectioned",
+      parentAgentId: "researcher-root",
+      goal: "Find roster facts.",
+      parentGoal: "question",
+      startUrl: "https://example.com/sectioned",
+      depth: 1,
+    };
+
+    const answer = await runResearcher(brief, client as never, logger as never, new SharedBudget());
+
+    expect(answer).toContain("Initial and additional facts");
+    expect(schemaNames).toContain("researcher_action_start_page_first");
+    expect(sawAdditionalSection).toBe(true);
+    expect(logger.log).toHaveBeenCalledWith(
+      "orchestrator_plan",
+      "researcher-root-sectioned",
+      expect.objectContaining({ action: "read_sections", sectionIds: ["S5"] }),
+    );
+  });
+
   it("rejects delegate_parallel when filtering leaves only one valid branch", async () => {
     vi.mocked(convertPage).mockResolvedValue(
       makeResult("https://www.google.com/search?q=x", {
@@ -293,6 +355,50 @@ describe("Researcher v2 delegation model", () => {
         reason: expect.stringContaining("at least 2 valid branches"),
       }),
     );
+  });
+
+  it("does not mark a single valid branch as visited when delegate_parallel is rejected", async () => {
+    vi.mocked(convertPage).mockResolvedValue(
+      makeResult("https://www.google.com/search?q=x", {
+        L1: { id: "L1", text: "Only valid", url: "https://example.com/a", kind: "external", sourcePath: "a" },
+      }),
+    );
+
+    const budget = new SharedBudget();
+    const client = {
+      complete: vi.fn(async (_agentId: string, _messages: unknown[], options: { responseSchema?: { name: string } }) => {
+        if (options.responseSchema?.name === "researcher_action_sub_initial") {
+          return response({ action: "search", engine: "google", query: "x", rationale: "start" });
+        }
+        if (options.responseSchema?.name === "researcher_action") {
+          return response({
+            action: "delegate_parallel",
+            branches: [
+              { task: "Read valid page.", linkId: "L1", startUrl: null, rationale: "valid" },
+              { task: "Read invalid page.", linkId: "L404", startUrl: null, rationale: "invalid" },
+            ],
+            rationale: "try two",
+          });
+        }
+        return response({
+          action: "done",
+          answer: "ANSWER:\nStopped.\n\nSOURCES:\n(none)\n\nCOVERAGE: partial\n\nGAPS:\n- branch rejected\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root-d1",
+      parentAgentId: "researcher-root",
+      goal: "Find sources.",
+      parentGoal: "question",
+      depth: 1,
+    };
+
+    await runResearcher(brief, client as never, logger as never, budget);
+
+    expect(budget.visitedUrls.has("https://example.com/a")).toBe(false);
+    expect(budget.exploresUsed).toBe(0);
   });
 
   it("uses session-wide candidate ids instead of page-local link ids", async () => {
@@ -395,5 +501,53 @@ describe("Researcher v2 delegation model", () => {
     expect(serpPrompt).toContain("[C1] already visited");
     expect(serpPrompt).toContain("[C2] available");
     expect(serpPrompt).toContain("Do not delegate candidates marked \"already visited\"");
+  });
+
+  it("caps visible targetId enums so structured outputs stay under provider limits", async () => {
+    const links: ConvertResult["links"]["links"] = {};
+    for (let i = 1; i <= 405; i++) {
+      links[`L${i}`] = {
+        id: `L${i}`,
+        text: `Candidate ${i}`,
+        url: `https://example.com/${i}`,
+        kind: "external",
+        sourcePath: `a${i}`,
+      };
+    }
+    vi.mocked(convertPage).mockResolvedValue(makeResult("https://example.com/many", links));
+
+    let pagePrompt = "";
+    let actionSchema: unknown;
+    const client = {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string; schema?: unknown } }) => {
+        actionSchema = options.responseSchema?.schema;
+        pagePrompt = messages.map((message) => message.content).join("\n");
+        return response({
+          action: "done",
+          answer: "ANSWER:\nStopped.\n\nSOURCES:\n- https://example.com/many\n\nCOVERAGE: partial\n\nGAPS:\n- Not delegated\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+    const brief: ResearcherBrief = {
+      agentId: "researcher-root-many",
+      parentAgentId: "researcher-root",
+      goal: "Read visible candidates.",
+      parentGoal: "question",
+      startUrl: "https://example.com/many",
+      depth: 1,
+    };
+
+    await runResearcher(brief, client as never, logger as never, new SharedBudget());
+
+    const targetIdEnums = collectTargetIdEnums(actionSchema);
+    expect(targetIdEnums.length).toBeGreaterThan(0);
+    for (const values of targetIdEnums) {
+      expect(values.length).toBeLessThanOrEqual(401);
+      expect(values).toContain("C400");
+      expect(values).not.toContain("C401");
+    }
+    expect(pagePrompt).toContain("[C400]");
+    expect(pagePrompt).not.toContain("[C401]");
   });
 });

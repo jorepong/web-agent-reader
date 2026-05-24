@@ -36,6 +36,8 @@ import {
   buildNoPaginateSchema,
   buildNoSearchSchema,
   buildParallelDelegateResultMessage,
+  buildPageSectionReadResultMessage,
+  buildReadSectionsOrDoneSchema,
   buildResearcherErrorMessage,
   buildRootCoordinatorMessages,
   buildRootInitialDelegateSchema,
@@ -57,6 +59,7 @@ import type { CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, Resear
 
 const SECTION_SELECTION_THRESHOLD_CHARS = 40_000;
 const MAX_SELECTED_PAGE_CHARS = 60_000;
+const MAX_SCHEMA_CANDIDATE_IDS = 400;
 
 class CandidateRegistry {
   private nextId = 1;
@@ -122,6 +125,35 @@ function visibleCandidateIds(markdown: string): string[] {
   return Array.from(new Set((markdown.match(/\[C\d+\]/g) ?? []).map((match) => match.slice(1, -1))));
 }
 
+function limitVisibleCandidates(markdown: string): { markdown: string; visibleIds: string[]; omittedCount: number } {
+  const visibleIds = visibleCandidateIds(markdown);
+  if (visibleIds.length <= MAX_SCHEMA_CANDIDATE_IDS) return { markdown, visibleIds, omittedCount: 0 };
+
+  const allowed = new Set(visibleIds.slice(0, MAX_SCHEMA_CANDIDATE_IDS));
+  const filteredMarkdown = markdown.replace(/\[C\d+\]/g, (match) => {
+    const id = match.slice(1, -1);
+    return allowed.has(id) ? match : "";
+  });
+  return {
+    markdown: filteredMarkdown,
+    visibleIds: visibleIds.slice(0, MAX_SCHEMA_CANDIDATE_IDS),
+    omittedCount: visibleIds.length - MAX_SCHEMA_CANDIDATE_IDS,
+  };
+}
+
+function mergeVisibleCandidateIds(existing: string[], next: string[]): string[] {
+  const merged: string[] = [];
+  for (const id of [...existing, ...next]) {
+    if (!merged.includes(id)) merged.push(id);
+    if (merged.length >= MAX_SCHEMA_CANDIDATE_IDS) break;
+  }
+  return merged;
+}
+
+function stripSectionPreviews(outline: string): string {
+  return outline.replace(/\s+preview="[^"]*"/g, "");
+}
+
 function formatCandidateStatus(
   candidates: Record<string, CandidateLink>,
   candidateIds: string[],
@@ -147,6 +179,13 @@ interface ParsedSectionSelection {
   rationale?: string;
 }
 
+interface PreparedPageRead {
+  markdown: string;
+  selectedIds: string[];
+  sectioned?: ReturnType<typeof buildSectionedMarkdown>;
+  outline?: string;
+}
+
 async function preparePageReadMarkdown(
   brief: ResearcherBrief,
   result: ConvertResult,
@@ -154,12 +193,12 @@ async function preparePageReadMarkdown(
   client: OpenAIClient,
   logger: V2Logger,
   budget: SharedBudget
-): Promise<string> {
+): Promise<PreparedPageRead> {
   const rewritten = rewriteLinkIds(result.markdown, candidates);
-  if (rewritten.length <= SECTION_SELECTION_THRESHOLD_CHARS) return rewritten;
+  if (rewritten.length <= SECTION_SELECTION_THRESHOLD_CHARS) return { markdown: rewritten, selectedIds: [] };
 
   const sectioned = buildSectionedMarkdown(rewritten);
-  if (sectioned.sections.length <= 1) return rewritten;
+  if (sectioned.sections.length <= 1) return { markdown: rewritten, selectedIds: [] };
 
   const outline = formatSectionOutline(sectioned.sections);
   await logger.log("page_sections", brief.agentId, {
@@ -211,10 +250,15 @@ async function preparePageReadMarkdown(
     rationale: selection?.rationale,
   });
 
-  return `Selected page sections from ${brief.startUrl ?? result.page.sourceUrl}.
+  return {
+    markdown: `Selected page sections from ${brief.startUrl ?? result.page.sourceUrl}.
 Unread sections may still contain relevant details; if coverage is incomplete, report the gap instead of inferring.
 
-${selected.markdown}`;
+${selected.markdown}`,
+    selectedIds: selected.selectedIds,
+    sectioned,
+    outline: stripSectionPreviews(outline),
+  };
 }
 
 // 한 라운드 동안 LLM에 허용할 행동을 동적으로 결정.
@@ -235,7 +279,8 @@ function pickSchema(
     Math.max(0, budget.limits.maxChildCallsPerAgent - childCallCount),
     budget.parallelSlotsRemaining()
   );
-  const candidateIds = currentSurface ? Object.keys(currentSurface.candidates) : [];
+  const candidateIds = currentSurface?.visibleCandidateIds ?? [];
+  const canReadSections = currentSurface?.kind === "page" && Boolean(currentSurface.pageSections);
 
   if (brief.parentAgentId === null) {
     if (!canDelegate) return buildDoneOnlySchema();
@@ -251,12 +296,13 @@ function pickSchema(
     return buildSubInitialSchema();
   }
   if (brief.startUrl && round === 1) {
-    return canDelegate ? buildStartPageFirstSchema(parallelLimit, candidateIds) : buildDoneOnlySchema();
+    return canDelegate ? buildStartPageFirstSchema(parallelLimit, candidateIds, canReadSections) : (canReadSections ? buildReadSectionsOrDoneSchema() : buildDoneOnlySchema());
   }
-  if (canSearch && canDelegate && canPaginate) return buildFullActionSchema(parallelLimit, candidateIds);
-  if (canSearch && canDelegate && !canPaginate) return buildNoPaginateSchema(parallelLimit, candidateIds);
-  if (canSearch && !canDelegate) return buildNoDelegateSchema(canPaginate);
-  if (!canSearch && canDelegate) return buildNoSearchSchema(parallelLimit, candidateIds);
+  if (canSearch && canDelegate && canPaginate) return buildFullActionSchema(parallelLimit, candidateIds, canReadSections);
+  if (canSearch && canDelegate && !canPaginate) return buildNoPaginateSchema(parallelLimit, candidateIds, canReadSections);
+  if (canSearch && !canDelegate) return buildNoDelegateSchema(canPaginate, canReadSections);
+  if (!canSearch && canDelegate) return buildNoSearchSchema(parallelLimit, candidateIds, canReadSections);
+  if (canReadSections) return buildReadSectionsOrDoneSchema();
   return buildDoneOnlySchema();
 }
 
@@ -298,6 +344,7 @@ interface ParsedAction {
   task?: string;
   rationale?: string;
   answer?: string;
+  sectionIds?: unknown;
   branches?: Array<{ targetId?: string | null; linkId?: string | null; startUrl?: string | null; task?: string; rationale?: string }>;
 }
 
@@ -419,15 +466,24 @@ export async function runResearcher(
         pageId: result.page.pageId,
       });
       const candidates = candidateRegistry.registerSurface(result, "page", brief.startUrl);
-      const pageReadMarkdown = await preparePageReadMarkdown(brief, result, candidates, client, logger, budget);
-      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(pageReadMarkdown), budget.visitedUrls);
+      const prepared = await preparePageReadMarkdown(brief, result, candidates, client, logger, budget);
+      const limited = limitVisibleCandidates(prepared.markdown);
+      if (limited.omittedCount > 0) {
+        await logger.log("page_section_selection", brief.agentId, {
+          url: brief.startUrl,
+          schemaCandidateLimit: MAX_SCHEMA_CANDIDATE_IDS,
+          omittedCandidateIds: limited.omittedCount,
+        });
+      }
+      const candidateStatus = formatCandidateStatus(candidates, limited.visibleIds, budget.visitedUrls);
       messages = buildChildInitialMessages(
         brief.goal,
         brief.parentGoal,
         brief.startUrl,
-        pageReadMarkdown,
+        limited.markdown,
         budget.limits.maxParallel,
-        candidateStatus
+        candidateStatus,
+        prepared.outline
       );
       // 자식의 시작 페이지를 currentSurface로 둔다 → 페이지의 [C*] 후보를 delegate할 때 동일 메커니즘 사용.
       // 검색 결과가 아니라 일반 페이지지만, links 레지스트리는 같은 형태라 그대로 활용 가능.
@@ -439,6 +495,11 @@ export async function runResearcher(
         url: brief.startUrl,
         result,
         candidates,
+        visibleCandidateIds: limited.visibleIds,
+        pageSections:
+          prepared.sectioned && prepared.outline
+            ? { sectioned: prepared.sectioned, outline: prepared.outline, readSectionIds: prepared.selectedIds }
+            : undefined,
       };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -494,6 +555,72 @@ export async function runResearcher(
       return answer;
     }
 
+    if (action.action === "read_sections") {
+      if (!currentSurface || currentSurface.kind !== "page" || !currentSurface.pageSections) {
+        await reject(round, "read_sections", `read_sections requires a current page with a section outline.`);
+        continue;
+      }
+
+      const requestedIds = Array.isArray(action.sectionIds)
+        ? action.sectionIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        : [];
+      if (requestedIds.length === 0) {
+        await reject(round, "read_sections", `read_sections.sectionIds must include at least one section ID.`);
+        continue;
+      }
+      const validSectionIds = new Set(currentSurface.pageSections.sectioned.sections.map((section) => section.id));
+      const validRequestedIds = requestedIds.filter((id) => validSectionIds.has(id));
+      if (validRequestedIds.length === 0) {
+        await reject(round, "read_sections", `None of the requested section IDs exist on the current page.`, { requestedIds });
+        continue;
+      }
+
+      const selected = selectSectionMarkdown(currentSurface.pageSections.sectioned, validRequestedIds, {
+        readWholePage: false,
+        maxChars: MAX_SELECTED_PAGE_CHARS,
+      });
+      currentSurface.pageSections.readSectionIds = Array.from(
+        new Set([...currentSurface.pageSections.readSectionIds, ...selected.selectedIds])
+      );
+
+      await logger.log("orchestrator_plan", brief.agentId, {
+        round,
+        action: "read_sections",
+        url: currentSurface.url,
+        sectionIds: selected.selectedIds,
+        requestedIds,
+        rationale: action.rationale,
+      });
+      await logger.log("page_section_selection", brief.agentId, {
+        url: currentSurface.url,
+        requestedIds,
+        selectedIds: selected.selectedIds,
+        selectedChars: selected.markdown.length,
+        truncated: selected.truncated,
+        incremental: true,
+        rationale: action.rationale,
+      });
+
+      const sectionMarkdown = `Additional selected page sections from ${currentSurface.url}.
+Already read in this branch: ${currentSurface.pageSections.readSectionIds.join(", ") || "(none)"}.
+
+${selected.markdown}`;
+      const limited = limitVisibleCandidates(sectionMarkdown);
+      currentSurface.visibleCandidateIds = mergeVisibleCandidateIds(currentSurface.visibleCandidateIds, limited.visibleIds);
+      const candidateStatus = formatCandidateStatus(currentSurface.candidates, currentSurface.visibleCandidateIds, budget.visitedUrls);
+      messages.push(
+        buildPageSectionReadResultMessage(
+          currentSurface.url,
+          selected.selectedIds,
+          limited.markdown,
+          currentSurface.pageSections.outline,
+          budget.summary(),
+          candidateStatus
+        )
+      );
+      continue;
+    }
+
     if (action.action === "search") {
       if (typeof action.engine !== "string" || !isSupportedEngine(action.engine)) {
         await reject(round, "search", `Unsupported or missing engine.`, { providedEngine: action.engine });
@@ -535,11 +662,11 @@ export async function runResearcher(
       }
 
       const candidates = candidateRegistry.registerSurface(result, "serp", url);
-      const snippets = extractSerpSnippets(result.markdown, candidates, true);
-      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(snippets), budget.visitedUrls);
-      currentSurface = { kind: "serp", engine, query, page, url, result, candidates };
+      const limited = limitVisibleCandidates(extractSerpSnippets(result.markdown, candidates, true));
+      const candidateStatus = formatCandidateStatus(candidates, limited.visibleIds, budget.visitedUrls);
+      currentSurface = { kind: "serp", engine, query, page, url, result, candidates, visibleCandidateIds: limited.visibleIds };
       await logger.log("page_markdown", brief.agentId, { url, markdown: result.markdown, pageId });
-      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary(), candidateStatus));
+      messages.push(buildSerpResultMessage(engine, query, page, limited.markdown, budget.summary(), candidateStatus));
       continue;
     }
 
@@ -583,11 +710,11 @@ export async function runResearcher(
       }
 
       const candidates = candidateRegistry.registerSurface(result, "serp", url);
-      const snippets = extractSerpSnippets(result.markdown, candidates, true);
-      const candidateStatus = formatCandidateStatus(candidates, visibleCandidateIds(snippets), budget.visitedUrls);
-      currentSurface = { kind: "serp", engine, query, page, url, result, candidates };
+      const limited = limitVisibleCandidates(extractSerpSnippets(result.markdown, candidates, true));
+      const candidateStatus = formatCandidateStatus(candidates, limited.visibleIds, budget.visitedUrls);
+      currentSurface = { kind: "serp", engine, query, page, url, result, candidates, visibleCandidateIds: limited.visibleIds };
       await logger.log("page_markdown", brief.agentId, { url, markdown: result.markdown, pageId });
-      messages.push(buildSerpResultMessage(engine, query, page, snippets, budget.summary(), candidateStatus));
+      messages.push(buildSerpResultMessage(engine, query, page, limited.markdown, budget.summary(), candidateStatus));
       continue;
     }
 
@@ -636,7 +763,7 @@ export async function runResearcher(
       };
 
       // 재귀 호출 — 자기 자신을 호출. 자식의 답변은 자연어 문자열.
-      const childAnswer = await runResearcher(childBrief, client, logger, budget, candidateRegistry);
+      const childAnswer = await runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
       messages.push(buildDelegateResultMessage(resolved.target.label, childAnswer, budget.summary()));
       continue;
     }
@@ -660,8 +787,7 @@ export async function runResearcher(
         const resolved = resolveDelegateTarget(b ?? {}, currentSurface, candidateRegistry);
         if (!resolved.ok) continue;
         if (resolved.target.startUrl && validBranches.some((vb) => vb.startUrl === resolved.target.startUrl)) continue;
-        const r = budget.reserveDelegate(resolved.target.startUrl);
-        if (!r.ok) continue;
+        if (resolved.target.startUrl && budget.visitedUrls.has(resolved.target.startUrl)) continue;
         validBranches.push(resolved.target);
         if (validBranches.length >= limit) break;
       }
@@ -677,16 +803,34 @@ export async function runResearcher(
         continue;
       }
 
-      childCallCount += validBranches.length;
+      const reservedBranches: DelegateTarget[] = [];
+      for (const branch of validBranches) {
+        const reserve = budget.reserveDelegate(branch.startUrl);
+        if (!reserve.ok) continue;
+        reservedBranches.push(branch);
+      }
+
+      if (reservedBranches.length < 2) {
+        await reject(
+          round,
+          "delegate_parallel",
+          reservedBranches.length === 0
+            ? `No valid branches remained after reservation.`
+            : `delegate_parallel requires at least 2 reserved branches; use delegate for a single remaining branch.`,
+        );
+        continue;
+      }
+
+      childCallCount += reservedBranches.length;
       await logger.log("orchestrator_plan", brief.agentId, {
         round,
         action: "delegate_parallel",
         rationale: action.rationale,
-        branches: validBranches.map((vb) => ({ targetId: vb.targetId, linkId: vb.linkId, url: vb.startUrl, task: vb.task, rationale: vb.rationale })),
+        branches: reservedBranches.map((vb) => ({ targetId: vb.targetId, linkId: vb.linkId, url: vb.startUrl, task: vb.task, rationale: vb.rationale })),
       });
 
       const childAnswers = await Promise.all(
-        validBranches.map((vb, i) => {
+        reservedBranches.map((vb, i) => {
           const childBrief: ResearcherBrief = {
             agentId: `${brief.agentId}-${round}-${i + 1}`,
             parentAgentId: brief.agentId,
@@ -695,13 +839,13 @@ export async function runResearcher(
             startUrl: vb.startUrl,
             depth: brief.depth + 1,
           };
-          return runResearcher(childBrief, client, logger, budget, candidateRegistry);
+          return runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
         })
       );
 
       messages.push(
         buildParallelDelegateResultMessage(
-          validBranches.map((vb, i) => ({ label: vb.label, answer: childAnswers[i] ?? "" })),
+          reservedBranches.map((vb, i) => ({ label: vb.label, answer: childAnswers[i] ?? "" })),
           budget.summary()
         )
       );
@@ -721,6 +865,25 @@ export async function runResearcher(
     budget,
     "Per-agent round budget exhausted."
   );
+}
+
+async function runChildResearcherSafely(
+  childBrief: ResearcherBrief,
+  client: OpenAIClient,
+  logger: V2Logger,
+  budget: SharedBudget,
+  candidateRegistry: CandidateRegistry
+): Promise<string> {
+  try {
+    return await runResearcher(childBrief, client, logger, budget, candidateRegistry);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const fallback = buildEmergencyFallback(childBrief, `Child researcher failed: ${detail}`);
+    await logger.log("exploration_report", childBrief.agentId, {
+      report: { agentId: childBrief.agentId, url: childBrief.startUrl ?? "", answer: fallback, error: detail },
+    });
+    return fallback;
+  }
 }
 
 // 한도 도달 시 LLM에 done-only 스키마와 함께 한 번 더 호출해 누적된 messages로 답변을 합성한다.
