@@ -11,10 +11,10 @@
     },
     "v2": {
       "maxRounds": 30,
-      "maxSearches": 8,
-      "maxExplores": 10,
+      "maxSearches": 20,
+      "maxExplores": 20,
       "maxParallel": 3,
-      "maxDepth": 3,
+      "maxDepth": 5,
       "maxChildCallsPerAgent": 3
     }
   }
