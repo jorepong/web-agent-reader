@@ -44,7 +44,7 @@ research(goal: string): Promise<string>
 - 깊은 레벨의 리서처가 "이 페이지로는 답이 안 됨" 판단 후 *자기 자리에서* 새로 search
 - 탐색 트리 어디에서나 delegate_parallel 가능 (이전 v1에서는 오케스트레이터 레벨의 explore_parallel만 가능)
 - 부모 리서처가 자식 응답을 자연어로 읽고 후속 행동 결정 → 구조화된 필드 의존도 감소
-- 합성이 별도 단계로 분리되지 않고 루트 리서처의 `done` 행동이 곧 답변
+- 일반 경로에서는 루트 리서처의 `done.answer`가 곧 최종 답변이며, 라운드 한도에 닿으면 done-only 스키마로 강제 합성을 한 번 더 시도
 
 ---
 
@@ -54,11 +54,11 @@ research(goal: string): Promise<string>
 |---|---|---|
 | 에이전트 종류 | 오케스트레이터 + 탐색 에이전트 | 단일 (Researcher) |
 | 출력 (재귀) | `ExplorationReport` 구조화 객체 | 자연어 문자열 (템플릿 포함) |
-| 출력 (외부) | 자연어 답변 (합성 단계 별도) | 자연어 문자열 (루트의 `done`) |
-| 합성 단계 | 루프 끝난 후 별도 LLM 호출 | 루트 리서처의 `done` 안으로 흡수 |
-| search/paginate 권한 | 오케스트레이터만 | 모든 깊이의 Researcher |
+| 출력 (외부) | 자연어 답변 (합성 단계 별도) | 자연어 문자열 (`done.answer` 또는 강제 합성 결과) |
+| 합성 단계 | 루프 끝난 후 별도 LLM 호출 | 일반 경로는 루트 `done.answer`, 한도 도달 시 `synthesizeFinalAnswer` |
+| search/paginate 권한 | 오케스트레이터만 | URL 없는 서브 리서처와 일부 비루트 상태. 루트와 시작 페이지 첫 라운드는 제외 |
 | explore 권한 | 두 에이전트 모두 | 동일 |
-| MAX_DEPTH | 2 (탐색 에이전트 기준) | 통합 깊이 (제안: 3~4) |
+| MAX_DEPTH | 2 (탐색 에이전트 기준) | 통합 깊이. 코드 기본값은 3, 저장소 config 기준 실행값은 5 |
 | URL 중복 방지 | 트리 내만 (트리 간 미공유) | 트리 전체 공유 (`SharedBudget`) |
 | 비용 한도 | 오케스트레이터/에이전트 각각 | `SharedBudget` 일원화 |
 | 거부 경로 로깅 | `orchestrator_plan(action:rejected)` | 동일 패턴 유지 |
@@ -211,40 +211,60 @@ runResearcher(brief):
   
   if brief.startUrl:
     page = convertPage(brief.startUrl)
-    messages = buildResearcherPagePrompt(brief, page)
+    if page is long:
+      sectionSelection = client.complete(..., schema=researcher_page_section_selection)
+      page = selected sections
+    currentSurface = page
+    messages = buildChildInitialMessages(brief, page)
   else:
-    messages = buildResearcherRootPrompt(brief)
+    currentSurface = null
+    if brief.parentAgentId == null:
+      messages = buildRootCoordinatorMessages(brief)
+    else:
+      messages = buildSubResearcherInitialMessages(brief)
   
-  currentSurface = null
-  
-  for round in 0..budget.limits.maxRounds:
-    if budget.roundsUsed >= budget.limits.maxRounds:
-      break  # 안전망
-    budget.roundsUsed++
+  perAgentMaxRounds = budget.limits.maxChildCallsPerAgent + 3
+  for round in 1..perAgentMaxRounds:
+    if budget.roundsRemaining() <= 0:
+      return synthesizeFinalAnswer(brief, messages, reason="트리 전체 라운드 예산 소진")
+    budget.consumeRound()
     
     schema = pickSchema(brief, budget, currentSurface, round, childCallCount)  # 동적 스키마
+    # root 첫 라운드: delegate/delegate_parallel만
+    # URL 시작 자식 첫 라운드: read_sections/delegate/delegate_parallel/done만
+    # URL 없는 서브 리서처 첫 라운드: search만
     text = client.complete(messages, schema)
-    messages.append(assistant: text)
     
     action = parseJsonResponse(text).decision
     if action invalid:
+      messages.append(assistant: text)
       reject(...) → continue
+    messages.append(assistant: normalized action JSON)
     
     switch action:
+      case "done":
+        log → return action.answer
+      case "read_sections":
+        selected = selectSectionMarkdown(...)
+        currentSurface.visibleCandidateIds += visible IDs from selected markdown
+        messages.append(user: section_read_result)
       case "search" | "paginate":
         ... (v1 오케스트레이터의 로직 거의 그대로)
         budget.reserveSearch(...) 통과 시에만 실행
+        currentSurface = SERP
       case "delegate":
         if !budget.reserveDelegate(url): reject; continue
+        childCallCount++
         childAnswer: string = await runResearcher(childBrief)  # 재귀!
         messages.append(user: child_result_message(childAnswer))
       case "delegate_parallel":
-        ... (Promise.all, 각 branch마다 reserveDelegate 체크)
-      case "done":
-        log → return text  # 자연어 답변 그대로 반환
+        filter invalid/duplicate branches first
+        reserve remaining branches
+        childAnswers = await Promise.all(runResearcher(childBrief))
+        messages.append(user: parallel_child_result_message(childAnswers))
   
-  # 한도 소진 → 폴백 답변
-  return buildFallbackAnswer(brief, messages)
+  # 에이전트별 라운드 한도 소진 → 누적 messages로 강제 합성
+  return synthesizeFinalAnswer(brief, messages, reason="에이전트별 라운드 예산 소진")
 ```
 
 ### research 래퍼
@@ -298,24 +318,25 @@ CLI에서는 `cli-runner.ts`가 env/config를 읽고 `V2Logger`, `OpenAIClient`,
 - 시나리오: root 위임 / 시작 페이지 첫 라운드 제한 / 긴 페이지 섹션 읽기 / delegate_parallel 거부 경로 / 후보 ID 제한 / 한도 도달
 
 ### Step 7 — 통합 점검
-- 실제 CLI로 한 번 돌려서 동작 확인 (사용자가 수행)
-- 디버그 로그가 v1 형식과 호환되는지 확인
+- 실제 CLI로 돌려서 v2 monitor 출력과 `researcher-*.jsonl` 로그 확인
+- 디버그 로그가 v2 페이로드(`startUrl`, `answer`, `forced` 등)를 읽기 좋게 표시하는지 확인
 
-본 작업 단위에서는 **Step 1~5까지** 진행한다. Step 6~7은 별도 작업으로 분리.
+현재 구현은 Step 1~7까지 진행된 상태다. 테스트 파일은 `test/researcher-v2.test.ts`에 있으며, 이후 작업은 시나리오 확장과 평가 하네스 도입이다.
 
 ---
 
 ## 8. 검증 방법
 
-### 자동 검증 (이번 단위 안에서)
+### 자동 검증
 - `npm run build` 통과
-- 기존 v1 테스트(9개) 모두 통과 (v1 코드는 건드리지 않음)
+- `npm test` 통과
+- v2 테스트 파일: `test/researcher-v2.test.ts`
 
-### 수동 검증 (사용자가 후속으로 수행)
+### 수동 검증
 - v1과 같은 쿼리로 v2 CLI 실행 후 결과 비교
   - 페이커 케이스 / 토스 채용 시나리오 등
 - 동일 쿼리에서 토큰 사용량 비교 (자기유사 재귀가 의도된 효율 개선을 가져오는지)
-- 깊은 리서처가 search를 자발적으로 호출하는지 (자유도 증가의 실질적 효과)
+- URL 없는 서브 리서처가 SERP를 만들고, 시작 URL을 받은 리서처가 첫 라운드에서 페이지 분석을 우선하는지 확인
 
 ---
 
@@ -375,6 +396,7 @@ src/search/v2/
 3. **자식 답변은 자연어 그대로 부모 messages에 append** — 별도 구조화 파싱 없음. 부모 LLM이 ANSWER/SOURCES/COVERAGE/GAPS/NEXT_CANDIDATES 템플릿을 읽고 후속 행동 판단.
 4. **per-agent 라운드 상한 = maxChildCallsPerAgent + 3** — 자식 호출 + 초기 + 마지막 done + 여유 1.
 5. **트리 전체 라운드 한도 + 개별 에이전트 라운드 한도 이중 제한**.
+6. **현재 날짜/시각은 런타임 user 메시지로 주입** — system prompt는 정적으로 유지해 prompt/KV cache prefix를 깨지 않으며, `research()`가 한 번 만든 시각 값을 전체 하위 리서처에 전달한다.
 
 ### 다음 단계 (별도 작업)
 
@@ -426,7 +448,7 @@ src/search/v2/
 - **얕은 읽기 (shallow read)**: SERP / 링크 인덱스 페이지. 1~8KB. 후보 URL 목록 + 짧은 스니펫을 훑어보는 용도.
 - **깊은 읽기 (deep read)**: 콘텐츠 페이지. 30~100KB. 정보 추출이 목적.
 
-루트는 "페이지를 안 읽는" 것이 아니라 **"깊은 읽기를 안 한다"**. 루트가 SERP를 *얕게* 읽고 그 신호로 후보 페이지를 선택해 자식에게 위임한다. **SERP가 도구의 입력 어댑터 역할**.
+루트는 "페이지를 안 읽는" 것이 아니라 **"깊은 읽기를 안 한다"**. 현재 구현에서 루트의 첫 행동은 발견 작업을 하위 리서처에게 위임하는 것이다. URL 없는 서브 리서처가 SERP를 *얕게* 읽고, 그 신호로 후보 페이지를 선택해 다시 하위 리서처에게 위임한다. **SERP가 도구의 입력 어댑터 역할**을 하지만, 그 얕은 읽기는 루트가 아니라 URL 없는 서브 리서처에서 일어난다.
 
 이 구분이 없으면 "루트는 페이지 안 읽음" / "에이전트는 위임만 함" 같은 표현이 잘못된 직관을 만든다.
 

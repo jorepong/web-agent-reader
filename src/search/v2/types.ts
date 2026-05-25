@@ -15,6 +15,10 @@ export interface ResearchOptions {
   budget?: Partial<BudgetLimits>;
 }
 
+export interface RuntimeContext {
+  currentDateTime: string;
+}
+
 // 트리 전체가 공유하는 비용·중복 한도.
 // 모든 필드 기본값은 SharedBudget 생성자에서 채워진다.
 export interface BudgetLimits {
@@ -36,6 +40,7 @@ export interface ResearcherBrief {
   parentGoal: string;             // 원래 사용자 질문 — 깊이와 무관하게 보존
   startUrl?: string;              // 있으면 시작점 페이지, 없으면 root
   depth: number;                  // root=0
+  runtimeContext?: RuntimeContext; // 실행 시점의 동적 컨텍스트. 시스템 프롬프트가 아닌 user 메시지에만 삽입.
 }
 
 // 리서처가 반환하는 자연어 답변.

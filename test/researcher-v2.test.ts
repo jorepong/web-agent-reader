@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertPage } from "../src/index.js";
 import { SharedBudget } from "../src/search/v2/budget.js";
-import { runResearcher } from "../src/search/v2/researcher.js";
+import { research, runResearcher } from "../src/search/v2/researcher.js";
 import type { ResearcherBrief } from "../src/search/v2/types.js";
 import type { ConvertResult } from "../src/types.js";
 
@@ -58,6 +58,28 @@ function collectTargetIdEnums(value: unknown, enums: unknown[][] = []): unknown[
 describe("Researcher v2 delegation model", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("passes current date/time through user messages without changing the system prompt", async () => {
+    let capturedMessages: Array<{ role: string; content: string }> = [];
+    const client = {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ role: string; content: string }>) => {
+        capturedMessages = messages;
+        return response({
+          action: "done",
+          answer: "ANSWER:\nRuntime captured.\n\nSOURCES:\n(none)\n\nCOVERAGE: none\n\nGAPS:\n(none)\n\nNEXT_CANDIDATES:\n(none)",
+        });
+      }),
+    };
+    const logger = { startAgent: vi.fn(), log: vi.fn(async () => undefined) };
+
+    await research("question", { budget: { maxExplores: 0 } }, client as never, logger as never);
+
+    expect(capturedMessages[0]?.role).toBe("system");
+    expect(capturedMessages[0]?.content).not.toContain("현재 날짜와 시각");
+    expect(capturedMessages[1]?.role).toBe("user");
+    expect(capturedMessages[1]?.content).toContain("현재 날짜와 시각");
+    expect(capturedMessages[1]?.content).toMatch(/ISO \d{4}-\d{2}-\d{2}T/);
   });
 
   it("forces the root researcher to delegate before it can synthesize", async () => {

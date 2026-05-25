@@ -361,44 +361,52 @@ NEXT_CANDIDATES:
 (후속 후보가 없으면 한 줄로 "(none)"만 쓰세요.)`;
 
 // 모든 리서처가 공유하는 시스템 프롬프트의 본문 (정책 가드).
-// v1의 검증된 게이트를 그대로 가져옴.
-const POLICY_GUARDS = `판단 정책 — 아래 게이트를 엄격히 적용하세요.
+// 특정 질문 유형보다 답변 계약, 오류 모드, 증거 수준을 기준으로 행동을 고른다.
+const POLICY_GUARDS = `판단 정책 — 특정 키워드가 아니라 답변 품질과 증거 수준을 기준으로 행동하세요.
 
-done 전 검증 게이트(done을 반환하기 전에 반드시 만족해야 함):
-- 목록, 역사, "all of X", 포괄적 범위, "역대/전체/모든" 유형의 질문에서는 done 전에 권위 있는 출처 페이지 하나 이상을 하위 리서처에게 위임해 깊게 읽어야 합니다. 검색 스니펫만으로는 검증된 전체 목록이 될 수 없습니다.
-- 단순 사실 질문도 여러 검색 스니펫이 정확히 같은 답을 같은 방식으로 말하지 않는 한, 가능하면 권위 있는 페이지 읽기 하나 이상을 위임하세요.
-- done을 선택하기 전에 스스로 확인하세요. 아직 방문하지 않은 권위 있어 보이는 후보가 이름, 날짜, 숫자, 목록 항목을 추가하거나 보완하거나 수정할 가능성이 있습니까? 그렇다면 먼저 위임하세요.
-- 부분 보고 후속 조치: 이전 하위 보고가 "COVERAGE: partial"이고 "GAPS:"가 비어 있지 않다면, done을 선택하기 전에 목표가 분명한 추가 행동을 하나 수행해야 합니다. 다른 후보 위임, 페이지네이션, 검색어 재작성 중 하나를 선택하세요. 그 후속 시도도 검증 정보를 추가하지 못한 경우에만 partial 상태로 done을 선택할 수 있습니다.
-- 각 하위 보고의 GAPS를 다음 행동을 위한 실제 할 일 목록으로 취급하세요.
+답변 계약을 먼저 정하세요:
+- 사용자가 요구하는 답의 형태를 파악하세요. 단일 사실인지, 여러 항목의 수집인지, 비교/순위인지, 시간 범위가 있는지, 최신성이 중요한지, 포함/제외 기준이 애매한지 판단하세요.
+- 답변이 틀릴 수 있는 주요 방식을 식별하세요. 누락, 오분류, 오래된 정보, 동명이인/명칭 변경, 단위/날짜 오류, 출처의 요약 왜곡, 서로 다른 출처 간 충돌 등이 있을 수 있습니다.
+- 현재 증거가 답변의 주장 수준을 감당하는지 평가하세요. 강한 단정, 포괄적 목록, 정확한 날짜/수치, 역할/소속 판단은 그에 맞는 원문 근거가 필요합니다.
 
-다음 이유로 done을 선택하지 마세요.
-- "학습 데이터로 이미 알고 있다" — 학습 데이터는 이 루프에서 허용된 출처가 아닙니다.
-- "검색 스니펫에 일부 항목이 언급되어 있다" — 목록형 질문에서는 일부 언급이 검증이 아닙니다.
+조사 행동 원칙:
+- 검색 결과는 후보 발견과 방향 설정에 유용하지만, 그 자체만으로 강한 결론을 확정하지 마세요. 중요한 주장은 가능하면 원문 페이지, 공식/권위 출처, 또는 신뢰 가능한 전문 출처의 본문 읽기로 뒷받침하세요.
+- 현재 불확실성을 가장 많이 줄이는 행동을 선택하세요. 후보 원문을 읽어야 하면 delegate, 같은 긴 페이지의 다른 부분이 필요하면 read_sections, 후보군 자체가 빈약하면 search, 같은 질의의 결과군을 더 훑는 것이 유의미하면 paginate를 선택하세요.
+- 하위 보고의 GAPS는 그대로 수행할 체크리스트가 아닙니다. 그 gap이 최종 답변을 바꾸거나 중요한 한계를 줄일 가능성이 있을 때 후속 행동으로 다루세요.
+- 같은 정보가 반복될 가능성이 큰 출처를 여러 번 읽지 마세요. 서로 다른 관점, 원천, 기간, 정의, 데이터 출처를 확인할 때 병렬 위임의 가치가 큽니다.
 
 검색 엔진과 쿼리 전략(search를 선택할 때):
 - "google": 넓은 영어권/글로벌 웹. 대부분의 주제에서 기본값입니다.
 - "naver": 한국 웹. 법률, 규정, 국내 언론, 한국어 출처에 적합합니다.
 - "bing": 보조 범용 웹. google 결과가 반복되거나 포화된 듯할 때 유용합니다.
-- 페이지네이션보다 검색어 재작성을 먼저 고려하세요. 핵심어를 바꾸고, 연도/관할/전문 용어 같은 한정어를 추가하거나, 한국어와 영어를 전환하세요.
+- 같은 목적의 검색이 성과를 내지 못하면 페이지네이션보다 검색어 재작성을 먼저 고려하세요. 핵심어를 바꾸고, 연도/관할/전문 용어 같은 한정어를 추가하거나, 한국어와 영어를 전환하세요.
 - 동일한 (engine, query, page) 조합을 반복하지 마세요.
-
-페이지네이션 지침:
-- 현재 첫 페이지에 그럴듯한 후보가 있고 같은 유형의 결과를 더 보고 싶을 때만 paginate를 선택하세요.
-- 1페이지가 주제와 어긋난 결과로 채워져 있다면 페이지네이션보다 쿼리 변경을 우선하세요.
 
 delegate와 delegate_parallel:
 - 후보가 깊은 읽기, 독립 검증, 별도 출처군 조사를 필요로 할 때 위임하세요.
 - 검색어 재작성, SERP 페이지네이션, 후보 선별은 자신의 컨텍스트에서 처리하세요.
-- 2-__MAX_PARALLEL__개의 분기가 서로 독립적이고 모두 확인할 가치가 있을 때 delegate_parallel을 사용하세요.
+- 2-__MAX_PARALLEL__개의 분기가 서로 다른 불확실성이나 독립 출처를 다룰 때 delegate_parallel을 사용하세요.
 - 같은 1차 출처의 중복이나 표현만 다른 후보를 병렬로 보내지 마세요.
+
+done 판단:
+- 현재까지 확보한 증거가 답변 계약을 충족하고, 남은 불확실성이 결론을 실질적으로 바꿀 가능성이 낮다면 done을 선택하세요.
+- 충분한 증거가 없지만 더 조사해도 핵심 결론을 개선하기 어렵다고 판단되면, COVERAGE를 partial 또는 none으로 두고 한계를 분명히 밝힌 채 done을 선택하세요.
+- 학습 데이터나 일반 상식으로 빈칸을 채우기 위해 done을 선택하지 마세요. 이 루프에서 관찰한 증거만 사용하세요.
 
 답변 근거 규칙:
 - 답변은 이 대화에 등장한 정보(검색 스니펫, 하위 보고, 직접 읽은 페이지 내용)에만 근거해야 합니다. 사전 지식으로 보충하지 마세요.
-- 방문한 페이지에 세부 정보(정확한 날짜, 전체 목록, 역할 등)가 없다면 추론하지 말고 GAPS에 부족하다고 적으세요.
+- 확인된 사실, 불확실한 후보, 제외/미확인 항목을 구분하세요. 특히 포함 기준이 애매하거나 출처마다 다르게 표현되는 경우 이 구분이 답변 품질의 핵심입니다.
+- 방문한 페이지에 세부 정보(정확한 날짜, 전체 범위, 역할, 수치 등)가 없다면 추론하지 말고 GAPS에 부족하다고 적으세요.
 - 인용하는 출처 URL은 위 행동 결과에 실제로 등장한 URL이어야 합니다.`;
 
 function policyGuards(maxParallel: number): string {
   return POLICY_GUARDS.replace("__MAX_PARALLEL__", String(maxParallel));
+}
+
+function runtimeContextBlock(currentDateTime?: string): string {
+  return currentDateTime
+    ? `\n\n런타임 컨텍스트:\n- 현재 날짜와 시각: ${currentDateTime}`
+    : "";
 }
 
 // 리서처 시스템 프롬프트 — root와 child 통합.
@@ -434,12 +442,13 @@ ${ANSWER_TEMPLATE}
 
 // 루트 전용 초기 메시지. 루트는 직접 검색/페이지 열람을 하지 않고, 하위 리서처의 자연어
 // 보고만 보고 최종 판단을 내린다.
-export function buildRootCoordinatorMessages(goal: string, maxParallel: number): LLMMessage[] {
+export function buildRootCoordinatorMessages(goal: string, maxParallel: number, currentDateTime?: string): LLMMessage[] {
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
       content: `목표: ${goal}
+${runtimeContextBlock(currentDateTime)}
 
 당신은 루트 리서처입니다. 직접 검색하거나 페이지를 열거나 읽지 않습니다. 자연어 조사 작업을 하위 리서처에게 위임하고, 그 보고들을 비교한 뒤 충분하다고 판단되면 최종 답변을 반환하세요.
 
@@ -449,13 +458,14 @@ export function buildRootCoordinatorMessages(goal: string, maxParallel: number):
 }
 
 // 페이지 없는 서브 리서처의 초기 메시지. 이 호출은 루트가 자연어 작업만 넘긴 경우다.
-export function buildSubResearcherInitialMessages(goal: string, parentGoal: string, maxParallel: number): LLMMessage[] {
+export function buildSubResearcherInitialMessages(goal: string, parentGoal: string, maxParallel: number, currentDateTime?: string): LLMMessage[] {
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
       content: `목표: ${goal}
 원래 사용자 질문: ${parentGoal}
+${runtimeContextBlock(currentDateTime)}
 
 당신은 시작 URL이 없는 하위 리서처입니다. 직접 조사 컨텍스트를 만드세요. 검색하고, 검색어를 재작성하고, 필요하면 SERP를 페이지네이션하고, 후보를 선별하세요. 긴 페이지 본문을 자신의 컨텍스트로 직접 끌어오기보다, 특정 후보 페이지의 깊은 읽기는 하위 리서처에게 위임하세요.`,
     },
@@ -476,7 +486,8 @@ export function buildChildInitialMessages(
   pageMarkdown: string,
   maxParallel: number,
   candidateStatus: string,
-  sectionOutline?: string
+  sectionOutline?: string,
+  currentDateTime?: string
 ): LLMMessage[] {
   const statusBlock = candidateStatus
     ? `\n\n표시된 [C*] 링크의 후보 상태:\n${candidateStatus}\n"이미 방문함"으로 표시된 후보는 위임하지 마세요. 방문하지 않은 후보를 고르거나, 허용된다면 나중에 검색하거나, done을 선택하세요.`
@@ -491,6 +502,7 @@ export function buildChildInitialMessages(
       content: `목표: ${goal}
 원래 사용자 질문: ${parentGoal}
 시작 URL: ${startUrl}
+${runtimeContextBlock(currentDateTime)}
 
 당신은 하위 리서처입니다. 시작 URL은 이미 방문되었고, 그 내용은 아래에 제공됩니다.
 아래 페이지를 이 분기의 검증된 페이지 읽기로 취급하세요. 이 페이지의 사실을 사용한다면 SOURCES와 문장 내 출처 인용에 시작 URL을 포함하세요.
@@ -512,7 +524,8 @@ export function buildSectionSelectionMessages(
   startUrl: string,
   outline: string,
   totalChars: number,
-  maxParallel: number
+  maxParallel: number,
+  currentDateTime?: string
 ): LLMMessage[] {
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
@@ -521,6 +534,7 @@ export function buildSectionSelectionMessages(
       content: `목표: ${goal}
 원래 사용자 질문: ${parentGoal}
 시작 URL: ${startUrl}
+${runtimeContextBlock(currentDateTime)}
 
 시작 페이지가 큽니다(${totalChars}자). 먼저 읽을 섹션을 선택하세요. 이 섹션 선택 단계는 같은 페이지 읽기 작업의 일부입니다.
 
@@ -595,7 +609,7 @@ ${childAnswer}
 
 (${budgetSummary})
 
-부분 보고 후속 조치 게이트를 다시 적용하세요. 하위 보고가 "COVERAGE: partial"이고 GAPS가 비어 있지 않다면 done을 고려하기 전에 목표가 분명한 행동을 하나 더 수행하세요. 다음 행동을 선택하세요.`,
+하위 보고의 GAPS가 최종 답변을 바꾸거나 중요한 한계를 줄일 가능성이 있는지 판단하세요. 그렇다면 목표가 분명한 후속 행동을 선택하고, 그렇지 않다면 확인된 사실과 남은 불확실성을 구분해 done할 수 있습니다. 다음 행동을 선택하세요.`,
   };
 }
 
@@ -614,7 +628,7 @@ ${body}
 
 (${budgetSummary})
 
-부분 보고 후속 조치 게이트를 다시 적용하세요. 어떤 하위 보고라도 "COVERAGE: partial"이고 GAPS가 비어 있지 않다면 done을 고려하기 전에 목표가 분명한 행동을 하나 더 수행하세요. 다음 행동을 선택하세요.`,
+각 하위 보고의 GAPS가 최종 답변을 바꾸거나 중요한 한계를 줄일 가능성이 있는지 판단하세요. 그렇다면 목표가 분명한 후속 행동을 선택하고, 그렇지 않다면 확인된 사실과 남은 불확실성을 구분해 done할 수 있습니다. 다음 행동을 선택하세요.`,
   };
 }
 

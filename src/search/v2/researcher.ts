@@ -55,11 +55,28 @@ import {
   formatSectionOutline,
   selectSectionMarkdown,
 } from "./sections.js";
-import type { CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, ResearchOptions, SurfaceKind } from "./types.js";
+import type { CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, ResearchOptions, RuntimeContext, SurfaceKind } from "./types.js";
 
 const SECTION_SELECTION_THRESHOLD_CHARS = 40_000;
 const MAX_SELECTED_PAGE_CHARS = 60_000;
 const MAX_SCHEMA_CANDIDATE_IDS = 400;
+
+function buildRuntimeContext(now = new Date()): RuntimeContext {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+  const localDateTime = new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(now);
+  return {
+    currentDateTime: `${localDateTime} (${timeZone}; ISO ${now.toISOString()})`,
+  };
+}
 
 class CandidateRegistry {
   private nextId = 1;
@@ -218,7 +235,8 @@ async function preparePageReadMarkdown(
         brief.startUrl ?? result.page.sourceUrl,
         outline,
         rewritten.length,
-        budget.limits.maxParallel
+        budget.limits.maxParallel,
+        brief.runtimeContext?.currentDateTime
       ),
       { responseSchema: buildSectionSelectionSchema(), reasoningEffort: "low" }
     );
@@ -483,7 +501,8 @@ export async function runResearcher(
         limited.markdown,
         budget.limits.maxParallel,
         candidateStatus,
-        prepared.outline
+        prepared.outline,
+        brief.runtimeContext?.currentDateTime
       );
       // 자식의 시작 페이지를 currentSurface로 둔다 → 페이지의 [C*] 후보를 delegate할 때 동일 메커니즘 사용.
       // 검색 결과가 아니라 일반 페이지지만, links 레지스트리는 같은 형태라 그대로 활용 가능.
@@ -512,8 +531,8 @@ export async function runResearcher(
   } else {
     messages =
       brief.parentAgentId === null
-        ? buildRootCoordinatorMessages(brief.goal, budget.limits.maxParallel)
-        : buildSubResearcherInitialMessages(brief.goal, brief.parentGoal, budget.limits.maxParallel);
+        ? buildRootCoordinatorMessages(brief.goal, budget.limits.maxParallel, brief.runtimeContext?.currentDateTime)
+        : buildSubResearcherInitialMessages(brief.goal, brief.parentGoal, budget.limits.maxParallel, brief.runtimeContext?.currentDateTime);
   }
 
   const reject = makeRejecter(logger, brief.agentId, budget, messages);
@@ -760,6 +779,7 @@ ${selected.markdown}`;
         parentGoal: brief.parentGoal,
         startUrl: resolved.target.startUrl,
         depth: brief.depth + 1,
+        runtimeContext: brief.runtimeContext,
       };
 
       // 재귀 호출 — 자기 자신을 호출. 자식의 답변은 자연어 문자열.
@@ -838,6 +858,7 @@ ${selected.markdown}`;
             parentGoal: brief.parentGoal,
             startUrl: vb.startUrl,
             depth: brief.depth + 1,
+            runtimeContext: brief.runtimeContext,
           };
           return runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
         })
@@ -947,12 +968,14 @@ export async function research(
   logger: V2Logger
 ): Promise<string> {
   const budget = new SharedBudget(options.budget);
+  const runtimeContext = buildRuntimeContext();
   const rootBrief: ResearcherBrief = {
     agentId: "researcher-root",
     parentAgentId: null,
     goal,
     parentGoal: goal,
     depth: 0,
+    runtimeContext,
   };
   return runResearcher(rootBrief, client, logger, budget);
 }
