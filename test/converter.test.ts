@@ -87,4 +87,52 @@ describe("convertHtml", () => {
     const docsLinks = Object.values(result.links.links).filter((link) => link.url.includes("/docs?"));
     expect(docsLinks).toHaveLength(1);
   });
+
+  it("keeps links when a list contains non-li interactive children", () => {
+    const result = convertHtml(
+      `<!doctype html>
+      <html>
+        <body>
+          <main>
+            <ul>
+              <li><a href="/career/job-detail?job_id=111">AIOps Platform Engineer</a></li>
+              <a href="/career/job-detail?job_id=6677722003">
+                <p>Cloud Engineer</p>
+                <p>인프라 ・ 오픈스택 ・ 클라우드</p>
+                <p>토스</p>
+              </a>
+            </ul>
+          </main>
+        </body>
+      </html>`,
+      "https://toss.im/career/jobs?main_category=Engineering",
+      { pageId: "P1" },
+    );
+
+    expect(result.markdown).toContain("Cloud Engineer");
+    expect(result.markdown).toContain("AIOps Platform Engineer");
+    expect(Object.values(result.links.links).some((link) => link.url === "https://toss.im/career/job-detail?job_id=111")).toBe(true);
+    expect(Object.values(result.links.links).some((link) => link.url === "https://toss.im/career/job-detail?job_id=6677722003")).toBe(true);
+  });
+
+  it("uses accessible labels for links without visible text", () => {
+    const result = convertHtml(
+      `<!doctype html>
+      <html>
+        <body>
+          <main>
+            <a href="/settings" aria-label="Settings"></a>
+            <a href="/profile" title="Profile"></a>
+          </main>
+        </body>
+      </html>`,
+      "https://example.com/start",
+      { pageId: "P1" },
+    );
+
+    expect(result.markdown).toContain("Settings [L1]");
+    expect(result.markdown).toContain("Profile [L2]");
+    expect(result.links.links.L1?.url).toBe("https://example.com/settings");
+    expect(result.links.links.L2?.url).toBe("https://example.com/profile");
+  });
 });

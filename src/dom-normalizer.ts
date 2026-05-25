@@ -198,11 +198,14 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
     const text = headingText(element, registry);
     return text ? [{ type: "heading", level: Number(tag[1]), text }] : [];
   }
-  if (tag === "p" || tag === "blockquote") {
+  if (tag === "p" || tag === "blockquote" || tag === "li") {
     const text = inlineText(element, registry, cssPath(element));
     return text ? [{ type: "paragraph", text: tag === "blockquote" ? `> ${text}` : text }] : [];
   }
-  if (tag === "ul" || tag === "ol") return listBlock(element, registry);
+  if (tag === "ul" || tag === "ol") {
+    const list = listBlock(element, registry);
+    if (list.length) return list;
+  }
   if (tag === "table") return [tableBlock(element, registry, options)];
   if (tag === "img") {
     const alt = compact(element.getAttribute("alt") ?? element.getAttribute("title") ?? "");
@@ -211,7 +214,7 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
     return [{ type: "image", alt, srcId }];
   }
   if (tag === "a") {
-    const text = compact(inlineText(element, registry, cssPath(element), true) || element.getAttribute("title") || "");
+    const text = linkText(element, registry);
     const linkId = registry.register(element.getAttribute("href"), text, cssPath(element));
     return text ? [{ type: "paragraph", text: linkId ? `${text} [${linkId}]` : text }] : [];
   }
@@ -238,9 +241,9 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
 }
 
 function isIgnorable(element: Element): boolean {
-  if (/^(img|input|button|select|textarea)$/i.test(element.tagName)) return false;
+  if (/^(a|img|input|button|select|textarea)$/i.test(element.tagName)) return false;
   const text = compact(element.textContent ?? "");
-  if (!text && !element.querySelector("img,input,button,select,textarea")) return true;
+  if (!text && !element.querySelector("a[href],img,input,button,select,textarea")) return true;
   const cls = element.getAttribute("class") ?? "";
   const id = element.getAttribute("id") ?? "";
   const role = element.getAttribute("role") ?? "";
@@ -315,8 +318,9 @@ function isParagraphLikeContainer(element: Element): boolean {
 
 function listBlock(element: Element, registry: LinkRegistryBuilder): ContentBlock[] {
   const ordered = element.tagName.toLowerCase() === "ol";
-  const items = Array.from(element.children)
-    .filter((child) => child.tagName.toLowerCase() === "li")
+  const children = Array.from(element.children);
+  if (children.some((child) => child.tagName.toLowerCase() !== "li")) return [];
+  const items = children
     .map((child) => inlineText(child, registry, cssPath(child)))
     .filter(Boolean)
     .slice(0, 80);
@@ -374,7 +378,7 @@ function inlineText(element: Element, registry: LinkRegistryBuilder, sourcePath:
     if (tag === "br") {
       parts.push(" ");
     } else if (tag === "a") {
-      const text = compact(inlineText(child, registry, cssPath(child), true) || child.getAttribute("title") || "");
+      const text = linkText(child, registry);
       const linkId = registry.register(child.getAttribute("href"), text, cssPath(child));
       parts.push(linkId ? `${text} [${linkId}]` : text);
     } else if (tag === "img") {
@@ -395,6 +399,15 @@ function inlineText(element: Element, registry: LinkRegistryBuilder, sourcePath:
     }
   }
   return compact(parts.join(" "));
+}
+
+function linkText(element: Element, registry: LinkRegistryBuilder): string {
+  return compact(
+    inlineText(element, registry, cssPath(element), true) ||
+      element.getAttribute("aria-label") ||
+      element.getAttribute("title") ||
+      "",
+  );
 }
 
 function headingText(element: Element, registry: LinkRegistryBuilder): string {
