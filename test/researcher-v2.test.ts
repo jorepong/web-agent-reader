@@ -275,7 +275,7 @@ describe("Researcher v2 delegation model", () => {
           return { text: JSON.stringify({ selection: { readWholePage: false, sectionIds: ["S4"], rationale: "Start with the initial section." } }), tokenUsage };
         }
         if (options.responseSchema?.name === "researcher_action_start_page_first") {
-          expect(allMessages).toContain("Current page section outline");
+          expect(allMessages).toContain("현재 페이지 섹션 목록");
           return response({ action: "read_sections", sectionIds: ["S5"], rationale: "Need the adjacent detail section before answering." });
         }
         sawAdditionalSection = allMessages.includes("Additional roster detail.");
@@ -352,7 +352,7 @@ describe("Researcher v2 delegation model", () => {
       expect.objectContaining({
         action: "rejected",
         requestedAction: "delegate_parallel",
-        reason: expect.stringContaining("at least 2 valid branches"),
+        reason: expect.stringContaining("유효한 분기가 최소 2개"),
       }),
     );
   });
@@ -498,9 +498,9 @@ describe("Researcher v2 delegation model", () => {
 
     await runResearcher(brief, client as never, logger as never, budget);
 
-    expect(serpPrompt).toContain("[C1] already visited");
-    expect(serpPrompt).toContain("[C2] available");
-    expect(serpPrompt).toContain("Do not delegate candidates marked \"already visited\"");
+    expect(serpPrompt).toContain("[C1] 이미 방문함");
+    expect(serpPrompt).toContain("[C2] 사용 가능");
+    expect(serpPrompt).toContain("\"이미 방문함\"으로 표시된 후보는 위임하지 마세요");
   });
 
   it("caps visible targetId enums so structured outputs stay under provider limits", async () => {

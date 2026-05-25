@@ -21,8 +21,8 @@ const actionSearch = {
   properties: {
     action: { type: "string", enum: ["search"] },
     engine: { type: "string", enum: ["google", "naver", "bing"] },
-    query: { type: "string", description: "Concise search query" },
-    rationale: { type: "string", description: "Why this engine and this query" },
+    query: { type: "string", description: "간결한 검색 쿼리" },
+    rationale: { type: "string", description: "이 검색 엔진과 쿼리를 선택한 이유" },
   },
   required: ["action", "engine", "query", "rationale"],
   additionalProperties: false,
@@ -32,7 +32,7 @@ const actionPaginate = {
   type: "object",
   properties: {
     action: { type: "string", enum: ["paginate"] },
-    page: { type: "integer", minimum: 1, description: "Target page number (1-based)" },
+    page: { type: "integer", minimum: 1, description: "이동할 검색 결과 페이지 번호. 1부터 시작" },
     rationale: { type: "string" },
   },
   required: ["action", "page", "rationale"],
@@ -48,9 +48,9 @@ const actionReadSections = {
       minItems: 1,
       maxItems: 8,
       items: { type: "string" },
-      description: "Section IDs from the current page outline, such as S12.",
+      description: "현재 페이지 섹션 목록에 있는 섹션 ID. 예: S12",
     },
-    rationale: { type: "string", description: "Why these additional sections are needed before answering" },
+    rationale: { type: "string", description: "답변 전에 이 추가 섹션들이 필요한 이유" },
   },
   required: ["action", "sectionIds", "rationale"],
   additionalProperties: false,
@@ -63,8 +63,8 @@ function targetIdProperty(candidateIds: string[]) {
     enum: allowed,
     description:
       candidateIds.length > 0
-        ? `Use one exact candidate ID from the current surface without brackets, for example C12 not [C12]. Use null when delegating by startUrl or task only.`
-        : "No current candidate IDs are available. Use null.",
+        ? `현재 표면에 표시된 후보 ID 하나를 대괄호 없이 정확히 사용하세요. 예: [C12]가 아니라 C12. startUrl 또는 작업만으로 위임할 때는 null을 사용하세요.`
+        : "현재 사용할 수 있는 후보 ID가 없습니다. null을 사용하세요.",
   } as const;
 }
 
@@ -73,15 +73,15 @@ function buildActionDelegate(candidateIds: string[] = []) {
     type: "object",
     properties: {
       action: { type: "string", enum: ["delegate"] },
-      task: { type: "string", description: "Natural-language sub-goal for the child researcher" },
+      task: { type: "string", description: "하위 리서처에게 전달할 자연어 하위 목표" },
       targetId: targetIdProperty(candidateIds),
       linkId: {
         type: ["string", "null"],
-        description: "Deprecated. Use targetId instead. Keep null unless an older prompt explicitly requires linkId.",
+        description: "폐기 예정 필드입니다. targetId를 사용하세요. 이전 형식의 프롬프트가 명시적으로 요구하지 않으면 null로 두세요.",
       },
       startUrl: {
         type: ["string", "null"],
-        description: "Explicit starting URL from prior reports, or null when the child should discover sources itself",
+        description: "이전 보고에 나온 명시적 시작 URL. 하위 리서처가 직접 출처를 찾아야 하면 null",
       },
       rationale: { type: "string" },
     },
@@ -112,7 +112,7 @@ function buildActionDelegateParallel(maxParallel: number, candidateIds: string[]
           additionalProperties: false,
         },
       },
-      rationale: { type: "string", description: "Why these branches are independent" },
+      rationale: { type: "string", description: "이 분기들이 서로 독립적인 이유" },
     },
     required: ["action", "branches", "rationale"],
     additionalProperties: false,
@@ -133,7 +133,7 @@ const actionDone = {
     answer: {
       type: "string",
       description:
-        "Final natural-language answer in the template format (ANSWER / SOURCES / COVERAGE / GAPS sections).",
+        "템플릿 형식(ANSWER / SOURCES / COVERAGE / GAPS 섹션)을 따르는 최종 자연어 답변.",
     },
   },
   required: ["action", "answer"],
@@ -152,14 +152,14 @@ export function buildSectionSelectionSchema() {
           properties: {
             readWholePage: {
               type: "boolean",
-              description: "Set true only when the whole page is necessary for this goal.",
+              description: "이 목표를 위해 전체 페이지가 필요할 때만 true로 설정하세요.",
             },
             sectionIds: {
               type: "array",
               minItems: 0,
               maxItems: 8,
               items: { type: "string" },
-              description: "Section IDs such as S3 to read. Use multiple IDs when needed.",
+              description: "읽을 섹션 ID. 예: S3. 필요하면 여러 ID를 사용하세요.",
             },
             rationale: { type: "string" },
           },
@@ -340,62 +340,62 @@ export function buildDoneOnlySchema() {
 
 // 자연어 답변 템플릿 — 모든 리서처의 출력 형태.
 // 부모 리서처의 LLM과 외부 호출자가 동일한 형식으로 파싱 가능.
-const ANSWER_TEMPLATE = `Your final \`done.answer\` MUST follow this exact template (sections in this order):
+const ANSWER_TEMPLATE = `최종 \`done.answer\`는 반드시 아래 템플릿을 그대로 따라야 합니다. 섹션 순서도 유지하세요.
 
 ANSWER:
-<concise natural-language answer addressing the goal. Cite sources inline as "(source: https://...)".>
+<목표에 직접 답하는 간결한 자연어 답변. 출처는 문장 안에 "(source: https://...)" 형식으로 인용하세요.>
 
 SOURCES:
 - <url 1>
 - <url 2>
-(If you used SERP snippets only, list "SERP only — pages not verified" and omit URLs.)
+(검색 결과 스니펫만 사용했고 페이지를 검증하지 않았다면 "SERP only — pages not verified"만 적고 URL은 생략하세요.)
 
 COVERAGE: <complete | partial | none>
 
 GAPS:
-- <missing item 1>
-- <missing item 2>
+- <부족한 정보 1>
+- <부족한 정보 2>
 
 NEXT_CANDIDATES:
-- <url or short candidate description> — <why it may help>
-(Use a single line "(none)" if no follow-up candidates.)`;
+- <url 또는 짧은 후보 설명> — <도움이 될 수 있는 이유>
+(후속 후보가 없으면 한 줄로 "(none)"만 쓰세요.)`;
 
 // 모든 리서처가 공유하는 시스템 프롬프트의 본문 (정책 가드).
 // v1의 검증된 게이트를 그대로 가져옴.
-const POLICY_GUARDS = `Decision policy — apply these gates strictly:
+const POLICY_GUARDS = `판단 정책 — 아래 게이트를 엄격히 적용하세요.
 
-Pre-done verification gate (must satisfy BEFORE returning done):
-- For list, history, "all of X", comprehensive coverage, or "역대/전체/모든" style questions, you MUST delegate at least one authoritative source page for deep reading before done. Search snippets alone never constitute a verified complete list.
-- For factual questions, prefer at least one delegated authoritative page read unless multiple SERP snippets phrase the exact answer identically.
-- Before choosing done, ask yourself: would an unvisited authoritative-looking candidate plausibly add, complete, or correct a name / date / number / list item? If yes, delegate it first.
-- Partial-report follow-up: if a previous child report you have received reported "COVERAGE: partial" with non-empty "GAPS:", you must take one more targeted action — delegate another candidate, paginate, or refine search — before you may choose done. Proceed to done despite partial only after such a follow-up also fails.
-- Treat each child report's GAPS as a literal todo list for your next action.
+done 전 검증 게이트(done을 반환하기 전에 반드시 만족해야 함):
+- 목록, 역사, "all of X", 포괄적 범위, "역대/전체/모든" 유형의 질문에서는 done 전에 권위 있는 출처 페이지 하나 이상을 하위 리서처에게 위임해 깊게 읽어야 합니다. 검색 스니펫만으로는 검증된 전체 목록이 될 수 없습니다.
+- 단순 사실 질문도 여러 검색 스니펫이 정확히 같은 답을 같은 방식으로 말하지 않는 한, 가능하면 권위 있는 페이지 읽기 하나 이상을 위임하세요.
+- done을 선택하기 전에 스스로 확인하세요. 아직 방문하지 않은 권위 있어 보이는 후보가 이름, 날짜, 숫자, 목록 항목을 추가하거나 보완하거나 수정할 가능성이 있습니까? 그렇다면 먼저 위임하세요.
+- 부분 보고 후속 조치: 이전 하위 보고가 "COVERAGE: partial"이고 "GAPS:"가 비어 있지 않다면, done을 선택하기 전에 목표가 분명한 추가 행동을 하나 수행해야 합니다. 다른 후보 위임, 페이지네이션, 검색어 재작성 중 하나를 선택하세요. 그 후속 시도도 검증 정보를 추가하지 못한 경우에만 partial 상태로 done을 선택할 수 있습니다.
+- 각 하위 보고의 GAPS를 다음 행동을 위한 실제 할 일 목록으로 취급하세요.
 
-Do NOT choose done because:
-- "I already know this from training" — your training data is not a permitted source.
-- "The SERP snippets mention some of the items" — partial mention is not verification for list-style questions.
+다음 이유로 done을 선택하지 마세요.
+- "학습 데이터로 이미 알고 있다" — 학습 데이터는 이 루프에서 허용된 출처가 아닙니다.
+- "검색 스니펫에 일부 항목이 언급되어 있다" — 목록형 질문에서는 일부 언급이 검증이 아닙니다.
 
-Engine and query strategy (when you choose search):
-- "google": broad English / global web. Default for most topics.
-- "naver": Korean web — laws, regulations, domestic media, Korean-language sources.
-- "bing": secondary general web; useful when google looks saturated.
-- Reformulate query before reaching for pagination. Change key terms, add qualifiers (year, jurisdiction, technical vocab), switch language (Korean ↔ English).
-- Do not repeat the exact same (engine, query, page) triple.
+검색 엔진과 쿼리 전략(search를 선택할 때):
+- "google": 넓은 영어권/글로벌 웹. 대부분의 주제에서 기본값입니다.
+- "naver": 한국 웹. 법률, 규정, 국내 언론, 한국어 출처에 적합합니다.
+- "bing": 보조 범용 웹. google 결과가 반복되거나 포화된 듯할 때 유용합니다.
+- 페이지네이션보다 검색어 재작성을 먼저 고려하세요. 핵심어를 바꾸고, 연도/관할/전문 용어 같은 한정어를 추가하거나, 한국어와 영어를 전환하세요.
+- 동일한 (engine, query, page) 조합을 반복하지 마세요.
 
-Pagination guidance:
-- Paginate only when the current first page has reasonable candidates and you want more of the same kind.
-- If page 1 is filled with off-topic results, prefer a query change over pagination.
+페이지네이션 지침:
+- 현재 첫 페이지에 그럴듯한 후보가 있고 같은 유형의 결과를 더 보고 싶을 때만 paginate를 선택하세요.
+- 1페이지가 주제와 어긋난 결과로 채워져 있다면 페이지네이션보다 쿼리 변경을 우선하세요.
 
-delegate vs delegate_parallel:
-- Delegate when a candidate needs deep reading, independent verification, or a separate source family investigation.
-- Stay in your own context for query reformulation, SERP pagination, and candidate triage.
-- Use delegate_parallel when 2-__MAX_PARALLEL__ branches are independent and ALL are worth checking.
-- Do NOT parallel-dispatch duplicates or paraphrases of the same primary source.
+delegate와 delegate_parallel:
+- 후보가 깊은 읽기, 독립 검증, 별도 출처군 조사를 필요로 할 때 위임하세요.
+- 검색어 재작성, SERP 페이지네이션, 후보 선별은 자신의 컨텍스트에서 처리하세요.
+- 2-__MAX_PARALLEL__개의 분기가 서로 독립적이고 모두 확인할 가치가 있을 때 delegate_parallel을 사용하세요.
+- 같은 1차 출처의 중복이나 표현만 다른 후보를 병렬로 보내지 마세요.
 
-Grounding rules for answers:
-- Base your answer ONLY on information that appeared in this conversation (SERP snippets or child reports). Do not supplement with prior knowledge.
-- If the visited pages lack a detail (exact dates, full lists, roles), do not infer it — say so in GAPS.
-- Source URLs cited must be ones actually returned in action results above.`;
+답변 근거 규칙:
+- 답변은 이 대화에 등장한 정보(검색 스니펫, 하위 보고, 직접 읽은 페이지 내용)에만 근거해야 합니다. 사전 지식으로 보충하지 마세요.
+- 방문한 페이지에 세부 정보(정확한 날짜, 전체 목록, 역할 등)가 없다면 추론하지 말고 GAPS에 부족하다고 적으세요.
+- 인용하는 출처 URL은 위 행동 결과에 실제로 등장한 URL이어야 합니다.`;
 
 function policyGuards(maxParallel: number): string {
   return POLICY_GUARDS.replace("__MAX_PARALLEL__", String(maxParallel));
@@ -404,32 +404,32 @@ function policyGuards(maxParallel: number): string {
 // 리서처 시스템 프롬프트 — root와 child 통합.
 // startUrl 유무에 따라 첫 user 메시지가 달라질 뿐, 시스템 프롬프트는 동일.
 export function buildResearcherSystemPrompt(maxParallel: number): string {
-  return `You are a Researcher — a recursive natural-language research agent.
+  return `당신은 리서처입니다. 자연어로 입력을 받고 자연어로 답하는 재귀형 조사 에이전트입니다.
 
-You receive a goal in natural language and produce a natural-language answer. You may dispatch sub-Researchers (which are instances of yourself) to investigate specific URLs in parallel or serially. The interface to a sub-Researcher is identical to your own: you give it a natural-language task and a starting URL, and it returns a natural-language answer in the same template you must follow.
+당신은 자연어 목표를 받고 자연어 답변을 생성합니다. 필요하면 자신과 같은 하위 리서처를 병렬 또는 직렬로 호출해 특정 URL이나 하위 목표를 조사하게 할 수 있습니다. 하위 리서처의 인터페이스도 당신과 같습니다. 자연어 작업과 선택적 시작 URL을 주면, 하위 리서처는 당신이 따라야 하는 것과 같은 템플릿의 자연어 답변을 반환합니다.
 
-You operate as an agentic loop. Each round you choose exactly one action; the system runs it and appends the result to this conversation. Continue until you have enough information to answer the goal, or until further search is clearly unproductive.
+당신은 에이전틱 루프로 동작합니다. 각 라운드마다 정확히 하나의 행동을 선택하세요. 시스템은 그 행동을 실행하고 결과를 이 대화에 추가합니다. 목표에 답할 충분한 정보가 모이거나, 추가 검색이 분명히 비생산적일 때까지 계속하세요.
 
-Available actions (subject to per-round constraints — the schema will only allow currently valid ones):
+사용 가능한 행동(라운드별 제약을 받으며, 스키마는 현재 가능한 행동만 허용합니다):
 
-1. search — fetch a fresh search-engine results page (SERP). Available to sub-Researchers, not the root.
-2. paginate — move to a different page of the CURRENT SERP.
-3. read_sections — read additional sections from the CURRENT page when the previous page section read was not enough.
-4. delegate — dispatch a sub-Researcher with a natural-language task. Optionally provide a targetId from the current surface or an explicit startUrl from prior reports.
-5. delegate_parallel — dispatch 2-${maxParallel} sub-Researchers in parallel to independent tasks.
-6. done — terminate with your final natural-language answer.
+1. search — 새 검색 엔진 결과 페이지(SERP)를 가져옵니다. 하위 리서처에서만 사용할 수 있고 루트는 사용할 수 없습니다.
+2. paginate — 현재 SERP의 다른 페이지로 이동합니다.
+3. read_sections — 현재 페이지에서 이미 읽은 섹션이 충분하지 않을 때 같은 페이지의 추가 섹션을 읽습니다.
+4. delegate — 자연어 작업으로 하위 리서처를 호출합니다. 현재 표면의 targetId나 이전 보고에 나온 명시적 startUrl을 선택적으로 제공할 수 있습니다.
+5. delegate_parallel — 서로 독립적인 작업에 대해 2-${maxParallel}개의 하위 리서처를 병렬 호출합니다.
+6. done — 최종 자연어 답변으로 종료합니다.
 
 ${policyGuards(maxParallel)}
 
 ${ANSWER_TEMPLATE}
 
-Important:
-- targetId in delegate/delegate_parallel MUST be a candidate ID like [C12] from the most recent SERP or page result shown above. Do not invent IDs. Do not use stale candidate IDs from earlier SERPs.
-- linkId is deprecated; keep it null unless the current message explicitly shows old-style [L*] IDs.
-- read_sections is only for the current page whose section outline was shown. Use section IDs exactly as shown, such as S12.
-- startUrl in delegate/delegate_parallel may be an explicit URL that appeared in a previous child report; use null if the child should discover sources itself.
-- task in delegate/delegate_parallel is the child's natural-language input. It should be self-contained and expressed in terms of the user's overall goal.
-- Once you return done, this branch is locked — you cannot revisit. Make sure the verification gates are satisfied first.`;
+중요:
+- delegate/delegate_parallel의 targetId는 위에 표시된 최신 SERP 또는 페이지 결과의 후보 ID여야 합니다. 예: [C12]처럼 보인다면 값은 C12입니다. ID를 만들지 말고, 이전 SERP의 오래된 후보 ID를 사용하지 마세요.
+- linkId는 폐기 예정입니다. 현재 메시지에 이전 형식의 [L*] ID가 명시적으로 보이지 않으면 null로 두세요.
+- read_sections는 섹션 목록이 표시된 현재 페이지에만 사용합니다. S12처럼 표시된 섹션 ID를 정확히 사용하세요.
+- delegate/delegate_parallel의 startUrl은 이전 하위 보고에 나온 명시적 URL일 수 있습니다. 하위 리서처가 직접 출처를 찾아야 하면 null을 사용하세요.
+- delegate/delegate_parallel의 task는 하위 리서처에게 전달되는 자연어 입력입니다. 원래 사용자 목표를 기준으로 자기완결적인 작업이어야 합니다.
+- done을 반환하면 이 분기는 잠깁니다. 다시 방문하거나 확장하거나 수정할 수 없습니다. 먼저 검증 게이트를 만족했는지 확인하세요.`;
 }
 
 // 루트 전용 초기 메시지. 루트는 직접 검색/페이지 열람을 하지 않고, 하위 리서처의 자연어
@@ -439,11 +439,11 @@ export function buildRootCoordinatorMessages(goal: string, maxParallel: number):
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
-      content: `Goal: ${goal}
+      content: `목표: ${goal}
 
-You are the root Researcher. You do not directly search, open, or read pages. Delegate natural-language research tasks to sub-Researchers, compare their reports, and return the final answer when the reports are sufficient.
+당신은 루트 리서처입니다. 직접 검색하거나 페이지를 열거나 읽지 않습니다. 자연어 조사 작업을 하위 리서처에게 위임하고, 그 보고들을 비교한 뒤 충분하다고 판단되면 최종 답변을 반환하세요.
 
-Your first action should normally be delegate or delegate_parallel. Use done only when the request can be answered from already-provided child reports.`,
+첫 행동은 보통 delegate 또는 delegate_parallel이어야 합니다. 이미 제공된 하위 보고만으로 요청에 답할 수 있을 때만 done을 사용하세요.`,
     },
   ];
 }
@@ -454,10 +454,10 @@ export function buildSubResearcherInitialMessages(goal: string, parentGoal: stri
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
-      content: `Goal: ${goal}
-Original user question: ${parentGoal}
+      content: `목표: ${goal}
+원래 사용자 질문: ${parentGoal}
 
-You are a sub-Researcher with no starting URL. Create an investigation context yourself: search, reformulate queries, paginate SERPs when useful, and triage candidates. Delegate deep reading of specific candidate pages to child Researchers instead of pulling long page bodies into your own context.`,
+당신은 시작 URL이 없는 하위 리서처입니다. 직접 조사 컨텍스트를 만드세요. 검색하고, 검색어를 재작성하고, 필요하면 SERP를 페이지네이션하고, 후보를 선별하세요. 긴 페이지 본문을 자신의 컨텍스트로 직접 끌어오기보다, 특정 후보 페이지의 깊은 읽기는 하위 리서처에게 위임하세요.`,
     },
   ];
 }
@@ -479,28 +479,28 @@ export function buildChildInitialMessages(
   sectionOutline?: string
 ): LLMMessage[] {
   const statusBlock = candidateStatus
-    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, search later if allowed, or done.`
+    ? `\n\n표시된 [C*] 링크의 후보 상태:\n${candidateStatus}\n"이미 방문함"으로 표시된 후보는 위임하지 마세요. 방문하지 않은 후보를 고르거나, 허용된다면 나중에 검색하거나, done을 선택하세요.`
     : "";
   const sectionBlock = sectionOutline
-    ? `\n\nCurrent page section outline:\n${sectionOutline}\nIf the provided page content is insufficient, choose read_sections with additional section IDs from this outline before searching or delegating away.`
+    ? `\n\n현재 페이지 섹션 목록:\n${sectionOutline}\n제공된 페이지 내용이 부족하다면 검색하거나 다른 곳으로 위임하기 전에, 이 목록의 추가 섹션 ID로 read_sections를 선택하세요.`
     : "";
   return [
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
-      content: `Goal: ${goal}
-Original user question: ${parentGoal}
-Starting URL: ${startUrl}
+      content: `목표: ${goal}
+원래 사용자 질문: ${parentGoal}
+시작 URL: ${startUrl}
 
-You are a sub-Researcher. A starting URL has been visited for you; its content is below.
-Treat the page below as a verified page read for this branch. If you use facts from it, cite the Starting URL in SOURCES and inline source citations.
+당신은 하위 리서처입니다. 시작 URL은 이미 방문되었고, 그 내용은 아래에 제공됩니다.
+아래 페이지를 이 분기의 검증된 페이지 읽기로 취급하세요. 이 페이지의 사실을 사용한다면 SOURCES와 문장 내 출처 인용에 시작 URL을 포함하세요.
 
-Your first action MUST analyze THIS PAGE:
-- If this page directly contains enough information to address the goal, choose done immediately and write the answer.
-- If this page does not directly answer but contains relevant linked pages (look for [C*] candidate IDs in the content), choose delegate or delegate_parallel to send those pages to child Researchers.
-- Do NOT choose search as your first action. Your parent dispatched you here because this page (and pages linked from it) is the right starting point. Only consider search after you have established that this page and its links cannot lead to the answer.
+첫 행동은 반드시 이 페이지를 분석하는 것이어야 합니다.
+- 이 페이지가 목표에 답할 충분한 정보를 직접 포함한다면 즉시 done을 선택하고 답변을 작성하세요.
+- 이 페이지가 직접 답을 포함하지 않지만 관련 링크 페이지를 포함한다면(본문의 [C*] 후보 ID를 보세요), delegate 또는 delegate_parallel로 해당 페이지를 하위 리서처에게 보내세요.
+- 첫 행동으로 search를 선택하지 마세요. 부모 리서처는 이 페이지와 여기서 연결되는 페이지가 적절한 시작점이라고 판단해 당신을 이곳에 보냈습니다. 이 페이지와 링크들이 답으로 이어질 수 없다고 확인한 뒤에만 search를 고려하세요.
 
-Page content:
+페이지 내용:
 ${pageMarkdown}${sectionBlock}${statusBlock}`,
     },
   ];
@@ -518,17 +518,17 @@ export function buildSectionSelectionMessages(
     { role: "system", content: buildResearcherSystemPrompt(maxParallel) },
     {
       role: "user",
-      content: `Goal: ${goal}
-Original user question: ${parentGoal}
-Starting URL: ${startUrl}
+      content: `목표: ${goal}
+원래 사용자 질문: ${parentGoal}
+시작 URL: ${startUrl}
 
-The starting page is large (${totalChars} characters), so you will first choose which sections to read. This section-selection step is part of the same page-read operation.
+시작 페이지가 큽니다(${totalChars}자). 먼저 읽을 섹션을 선택하세요. 이 섹션 선택 단계는 같은 페이지 읽기 작업의 일부입니다.
 
-Choose the smallest set of sections likely to answer the goal. You may choose multiple sections. Prefer specific child sections over huge parent sections when the outline shows them. Choose readWholePage=true only when the goal truly requires the full page and section targeting is unsafe.
+목표에 답할 가능성이 높은 최소 섹션 집합을 선택하세요. 여러 섹션을 선택할 수 있습니다. 목록에 구체적인 하위 섹션이 보이면 큰 상위 섹션보다 하위 섹션을 우선하세요. 목표가 정말 전체 페이지를 필요로 하거나 섹션 지정이 위험할 때만 readWholePage=true를 선택하세요.
 
-Include navigation/header/footer sections only when the task requires finding links, menus, pagination, or site navigation.
+링크, 메뉴, 페이지네이션, 사이트 탐색을 찾아야 하는 작업일 때만 navigation/header/footer 섹션을 포함하세요.
 
-Section outline:
+섹션 목록:
 ${outline}`,
     },
   ];
@@ -543,9 +543,9 @@ export function buildSerpResultMessage(
   budgetSummary: string,
   candidateStatus: string
 ): LLMMessage {
-  const body = serpSnippets.trim() || "(no usable results found on this page)";
+  const body = serpSnippets.trim() || "(이 페이지에서 사용할 만한 결과를 찾지 못했습니다)";
   const statusBlock = candidateStatus
-    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, reformulate search, paginate when useful, or done.`
+    ? `\n\n표시된 [C*] 링크의 후보 상태:\n${candidateStatus}\n"이미 방문함"으로 표시된 후보는 위임하지 마세요. 방문하지 않은 후보를 선택하거나, 검색어를 재작성하거나, 유용하면 페이지네이션하거나, done을 선택하세요.`
     : "";
   return {
     role: "user",
@@ -554,7 +554,7 @@ ${body}${statusBlock}
 
 (${budgetSummary})
 
-Choose your next action.`,
+다음 행동을 선택하세요.`,
   };
 }
 
@@ -567,21 +567,21 @@ export function buildPageSectionReadResultMessage(
   candidateStatus: string
 ): LLMMessage {
   const statusBlock = candidateStatus
-    ? `\n\nCandidate status for visible [C*] links:\n${candidateStatus}\nDo not delegate candidates marked "already visited"; choose an unvisited candidate, read more sections if needed, search later if allowed, or done.`
+    ? `\n\n표시된 [C*] 링크의 후보 상태:\n${candidateStatus}\n"이미 방문함"으로 표시된 후보는 위임하지 마세요. 방문하지 않은 후보를 선택하거나, 필요하면 섹션을 더 읽거나, 허용된다면 나중에 검색하거나, done을 선택하세요.`
     : "";
   return {
     role: "user",
-    content: `[Additional page sections — ${startUrl}]
-selected: ${selectedIds.length ? selectedIds.join(", ") : "(fallback)"}
+    content: `[추가 페이지 섹션 — ${startUrl}]
+선택됨: ${selectedIds.length ? selectedIds.join(", ") : "(fallback)"}
 
 ${sectionMarkdown}
 
-Current page section outline:
+현재 페이지 섹션 목록:
 ${sectionOutline}${statusBlock}
 
 (${budgetSummary})
 
-Choose your next action.`,
+다음 행동을 선택하세요.`,
   };
 }
 
@@ -590,12 +590,12 @@ Choose your next action.`,
 export function buildDelegateResultMessage(childLabel: string, childAnswer: string, budgetSummary: string): LLMMessage {
   return {
     role: "user",
-    content: `[Child Researcher result — ${childLabel}]
+    content: `[하위 리서처 결과 — ${childLabel}]
 ${childAnswer}
 
 (${budgetSummary})
 
-Re-apply the partial-report follow-up gate: if the child reported "COVERAGE: partial" with non-empty GAPS, take one more targeted action before considering done. Choose your next action.`,
+부분 보고 후속 조치 게이트를 다시 적용하세요. 하위 보고가 "COVERAGE: partial"이고 GAPS가 비어 있지 않다면 done을 고려하기 전에 목표가 분명한 행동을 하나 더 수행하세요. 다음 행동을 선택하세요.`,
   };
 }
 
@@ -609,12 +609,12 @@ export function buildParallelDelegateResultMessage(
     .join("\n\n---\n\n");
   return {
     role: "user",
-    content: `[Parallel child Researchers — ${children.length} branches]
+    content: `[병렬 하위 리서처 — ${children.length}개 분기]
 ${body}
 
 (${budgetSummary})
 
-Re-apply the partial-report follow-up gate: if any child reported "COVERAGE: partial" with non-empty GAPS, take one more targeted action before considering done. Choose your next action.`,
+부분 보고 후속 조치 게이트를 다시 적용하세요. 어떤 하위 보고라도 "COVERAGE: partial"이고 GAPS가 비어 있지 않다면 done을 고려하기 전에 목표가 분명한 행동을 하나 더 수행하세요. 다음 행동을 선택하세요.`,
   };
 }
 
@@ -622,11 +622,11 @@ Re-apply the partial-report follow-up gate: if any child reported "COVERAGE: par
 export function buildResearcherErrorMessage(detail: string, budgetSummary: string): LLMMessage {
   return {
     role: "user",
-    content: `[Action could not be executed] ${detail}
+    content: `[행동을 실행할 수 없음] ${detail}
 
 (${budgetSummary})
 
-Choose a different action.`,
+다른 행동을 선택하세요.`,
   };
 }
 
@@ -634,11 +634,11 @@ Choose a different action.`,
 export function buildBudgetWarningMessage(detail: string, budgetSummary: string): LLMMessage {
   return {
     role: "user",
-    content: `[Budget notice] ${detail}
+    content: `[예산 알림] ${detail}
 
 (${budgetSummary})
 
-Prioritize wrapping up — answer the goal with what you have, or take one final targeted action before done.`,
+마무리를 우선하세요. 지금까지 확보한 정보로 목표에 답하거나, done 전에 마지막으로 목표가 분명한 행동 하나만 수행하세요.`,
   };
 }
 
@@ -647,9 +647,9 @@ Prioritize wrapping up — answer the goal with what you have, or take one final
 export function buildForcedSynthesisMessage(reason: string, budgetSummary: string): LLMMessage {
   return {
     role: "user",
-    content: `[Limit reached — synthesize now] ${reason}. You cannot take any more search or delegate actions.
+    content: `[한도 도달 — 지금 합성하세요] ${reason}. 더 이상 search 또는 delegate 행동을 수행할 수 없습니다.
 
-Synthesize your final answer using ONLY the information that has already appeared in this conversation (SERP snippets, child reports, your own page reads). Follow the ANSWER / SOURCES / COVERAGE / GAPS template. Set COVERAGE honestly based on what you have gathered; list any unresolved items in GAPS. Do not refuse — even if information is incomplete, return the best partial answer you can from what you already have.
+이 대화에 이미 등장한 정보(SERP 스니펫, 하위 보고, 직접 읽은 페이지 내용)만 사용해 최종 답변을 합성하세요. ANSWER / SOURCES / COVERAGE / GAPS 템플릿을 따르세요. 수집한 정보에 따라 COVERAGE를 정직하게 설정하고, 해결되지 않은 항목은 GAPS에 적으세요. 거절하지 마세요. 정보가 불완전하더라도 지금 가진 정보로 가능한 최선의 부분 답변을 반환하세요.
 
 (${budgetSummary})`,
   };

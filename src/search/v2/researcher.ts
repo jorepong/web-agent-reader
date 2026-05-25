@@ -151,7 +151,7 @@ function mergeVisibleCandidateIds(existing: string[], next: string[]): string[] 
 }
 
 function stripSectionPreviews(outline: string): string {
-  return outline.replace(/\s+preview="[^"]*"/g, "");
+  return outline.replace(/\s+\|\s+미리보기="[^"]*"/g, "");
 }
 
 function formatCandidateStatus(
@@ -165,11 +165,11 @@ function formatCandidateStatus(
     .filter((candidate): candidate is CandidateLink => Boolean(candidate))
     .slice(0, maxRows)
     .map((candidate) => {
-      const status = visitedUrls.has(candidate.url) ? "already visited" : "available";
+      const status = visitedUrls.has(candidate.url) ? "이미 방문함" : "사용 가능";
       return `[${candidate.id}] ${status} — ${candidate.text} — ${candidate.url}`;
     });
   if (rows.length === 0) return "";
-  if (candidateIds.length > maxRows) rows.push(`... ${candidateIds.length - maxRows} more visible candidates omitted from status list`);
+  if (candidateIds.length > maxRows) rows.push(`... 표시 후보 ${candidateIds.length - maxRows}개는 상태 목록에서 생략됨`);
   return rows.join("\n");
 }
 
@@ -251,8 +251,8 @@ async function preparePageReadMarkdown(
   });
 
   return {
-    markdown: `Selected page sections from ${brief.startUrl ?? result.page.sourceUrl}.
-Unread sections may still contain relevant details; if coverage is incomplete, report the gap instead of inferring.
+    markdown: `${brief.startUrl ?? result.page.sourceUrl}에서 선택한 페이지 섹션입니다.
+읽지 않은 섹션에 관련 세부 정보가 남아 있을 수 있습니다. 범위가 불완전하면 추론하지 말고 부족한 점을 보고하세요.
 
 ${selected.markdown}`,
     selectedIds: selected.selectedIds,
@@ -363,7 +363,7 @@ function resolveDelegateTarget(
   candidateRegistry: CandidateRegistry
 ): { ok: true; target: DelegateTarget } | { ok: false; reason: string } {
   if (typeof action.task !== "string" || !action.task.trim()) {
-    return { ok: false, reason: `delegate.task is required (natural-language sub-goal).` };
+    return { ok: false, reason: `delegate.task가 필요합니다. 자연어 하위 목표를 제공하세요.` };
   }
 
   const targetId = typeof action.targetId === "string" && action.targetId.trim() ? action.targetId.trim() : undefined;
@@ -372,23 +372,23 @@ function resolveDelegateTarget(
 
   const selectorCount = [targetId, linkId, rawStartUrl].filter(Boolean).length;
   if (selectorCount > 1) {
-    return { ok: false, reason: `Provide only one of targetId, linkId, or startUrl for delegate.` };
+    return { ok: false, reason: `delegate에는 targetId, linkId, startUrl 중 하나만 제공하세요.` };
   }
 
   if (targetId) {
-    if (!currentSurface) return { ok: false, reason: `delegate.targetId requires a current SERP/page surface.` };
+    if (!currentSurface) return { ok: false, reason: `delegate.targetId를 사용하려면 현재 SERP 또는 페이지 표면이 필요합니다.` };
     const candidate = currentSurface.candidates[targetId];
     if (!candidate) {
       const known = candidateRegistry.get(targetId);
-      const stale = known ? ` It appeared on an earlier ${known.surfaceKind} surface and is stale now.` : "";
-      return { ok: false, reason: `targetId ${targetId} not found on the current SERP/page.${stale}` };
+      const stale = known ? ` 이 ID는 이전 ${known.surfaceKind} 표면에 있었으므로 지금은 오래된 후보입니다.` : "";
+      return { ok: false, reason: `현재 SERP 또는 페이지에서 targetId ${targetId}를 찾을 수 없습니다.${stale}` };
     }
     return {
       ok: true,
       target: {
         task: action.task.trim(),
         startUrl: candidate.url,
-        label: `candidate ${candidate.id}: ${candidate.text} (${candidate.url})`,
+        label: `후보 ${candidate.id}: ${candidate.text} (${candidate.url})`,
         targetId: candidate.id,
         linkId: candidate.originalLinkId,
         rationale: action.rationale,
@@ -397,15 +397,15 @@ function resolveDelegateTarget(
   }
 
   if (linkId) {
-    if (!currentSurface) return { ok: false, reason: `delegate.linkId requires a current SERP/page surface.` };
+    if (!currentSurface) return { ok: false, reason: `delegate.linkId를 사용하려면 현재 SERP 또는 페이지 표면이 필요합니다.` };
     const entry = currentSurface.result.links.links[linkId];
-    if (!entry) return { ok: false, reason: `linkId ${linkId} not found on the current SERP/page.` };
+    if (!entry) return { ok: false, reason: `현재 SERP 또는 페이지에서 linkId ${linkId}를 찾을 수 없습니다.` };
     return {
       ok: true,
       target: {
         task: action.task.trim(),
         startUrl: entry.url,
-        label: `legacy link ${linkId}: ${entry.text} (${entry.url})`,
+        label: `이전 형식 링크 ${linkId}: ${entry.text} (${entry.url})`,
         linkId,
         rationale: action.rationale,
       },
@@ -425,7 +425,7 @@ function resolveDelegateTarget(
         },
       };
     } catch {
-      return { ok: false, reason: `delegate.startUrl must be a valid absolute URL.` };
+      return { ok: false, reason: `delegate.startUrl은 유효한 절대 URL이어야 합니다.` };
     }
   }
 
@@ -433,7 +433,7 @@ function resolveDelegateTarget(
     ok: true,
     target: {
       task: action.task.trim(),
-      label: `task-only delegation: ${action.task.trim()}`,
+      label: `작업만 위임: ${action.task.trim()}`,
       rationale: action.rationale,
     },
   };
@@ -503,7 +503,7 @@ export async function runResearcher(
       };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      const fallback = buildEmergencyFallback(brief, `Page could not be loaded: ${detail}`);
+      const fallback = buildEmergencyFallback(brief, `페이지를 불러올 수 없음: ${detail}`);
       await logger.log("exploration_report", brief.agentId, {
         report: { agentId: brief.agentId, url: brief.startUrl, answer: fallback },
       });
@@ -524,7 +524,7 @@ export async function runResearcher(
   for (let round = 1; round <= perAgentMaxRounds; round++) {
     if (budget.roundsRemaining() <= 0) {
       // 트리 전체 라운드 한도 도달 — 누적된 정보로 합성을 강제하여 빈손으로 끝나지 않게 한다.
-      return synthesizeFinalAnswer(brief, messages, client, logger, budget, "Tree-wide round budget exhausted.");
+      return synthesizeFinalAnswer(brief, messages, client, logger, budget, "트리 전체 라운드 예산이 소진되었습니다.");
     }
     budget.consumeRound();
 
@@ -538,7 +538,7 @@ export async function runResearcher(
     const action = wrapper?.decision;
     if (!action || typeof action.action !== "string") {
       messages.push({ role: "assistant", content: text });
-      await reject(round, "unknown", "Your previous response had no valid 'decision.action' field.", {
+      await reject(round, "unknown", "이전 응답에 유효한 'decision.action' 필드가 없습니다.", {
         rawResponsePreview: text.slice(0, 200),
       });
       continue;
@@ -557,7 +557,7 @@ export async function runResearcher(
 
     if (action.action === "read_sections") {
       if (!currentSurface || currentSurface.kind !== "page" || !currentSurface.pageSections) {
-        await reject(round, "read_sections", `read_sections requires a current page with a section outline.`);
+        await reject(round, "read_sections", `read_sections를 사용하려면 섹션 목록이 있는 현재 페이지가 필요합니다.`);
         continue;
       }
 
@@ -565,13 +565,13 @@ export async function runResearcher(
         ? action.sectionIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
         : [];
       if (requestedIds.length === 0) {
-        await reject(round, "read_sections", `read_sections.sectionIds must include at least one section ID.`);
+        await reject(round, "read_sections", `read_sections.sectionIds에는 섹션 ID가 하나 이상 있어야 합니다.`);
         continue;
       }
       const validSectionIds = new Set(currentSurface.pageSections.sectioned.sections.map((section) => section.id));
       const validRequestedIds = requestedIds.filter((id) => validSectionIds.has(id));
       if (validRequestedIds.length === 0) {
-        await reject(round, "read_sections", `None of the requested section IDs exist on the current page.`, { requestedIds });
+        await reject(round, "read_sections", `요청한 섹션 ID가 현재 페이지에 존재하지 않습니다.`, { requestedIds });
         continue;
       }
 
@@ -601,8 +601,8 @@ export async function runResearcher(
         rationale: action.rationale,
       });
 
-      const sectionMarkdown = `Additional selected page sections from ${currentSurface.url}.
-Already read in this branch: ${currentSurface.pageSections.readSectionIds.join(", ") || "(none)"}.
+      const sectionMarkdown = `${currentSurface.url}에서 추가로 선택한 페이지 섹션입니다.
+이 분기에서 이미 읽은 섹션: ${currentSurface.pageSections.readSectionIds.join(", ") || "(none)"}.
 
 ${selected.markdown}`;
       const limited = limitVisibleCandidates(sectionMarkdown);
@@ -623,11 +623,11 @@ ${selected.markdown}`;
 
     if (action.action === "search") {
       if (typeof action.engine !== "string" || !isSupportedEngine(action.engine)) {
-        await reject(round, "search", `Unsupported or missing engine.`, { providedEngine: action.engine });
+        await reject(round, "search", `지원하지 않거나 누락된 검색 엔진입니다.`, { providedEngine: action.engine });
         continue;
       }
       if (typeof action.query !== "string" || !action.query.trim()) {
-        await reject(round, "search", `search.query is required.`);
+        await reject(round, "search", `search.query가 필요합니다.`);
         continue;
       }
       const engine = action.engine;
@@ -657,7 +657,7 @@ ${selected.markdown}`;
         result = await convertPage(url, { scroll: false, stealth: true, pageId });
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
-        await reject(round, "search", `Failed to load SERP: ${detail}`, { url });
+        await reject(round, "search", `SERP를 불러오지 못했습니다: ${detail}`, { url });
         continue;
       }
 
@@ -672,11 +672,11 @@ ${selected.markdown}`;
 
     if (action.action === "paginate") {
       if (!currentSurface || currentSurface.kind !== "serp" || !currentSurface.query) {
-        await reject(round, "paginate", `paginate requires an active SERP context (no SERP in this researcher yet).`);
+        await reject(round, "paginate", `paginate를 사용하려면 활성 SERP 컨텍스트가 필요합니다. 아직 이 리서처에 SERP가 없습니다.`);
         continue;
       }
       if (typeof action.page !== "number" || action.page < 1) {
-        await reject(round, "paginate", `paginate.page must be a positive integer.`, { providedPage: action.page });
+        await reject(round, "paginate", `paginate.page는 양의 정수여야 합니다.`, { providedPage: action.page });
         continue;
       }
       const engine = currentSurface.engine;
@@ -705,7 +705,7 @@ ${selected.markdown}`;
         result = await convertPage(url, { scroll: false, stealth: true, pageId });
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
-        await reject(round, "paginate", `Failed to load SERP: ${detail}`, { url });
+        await reject(round, "paginate", `SERP를 불러오지 못했습니다: ${detail}`, { url });
         continue;
       }
 
@@ -720,11 +720,11 @@ ${selected.markdown}`;
 
     if (action.action === "delegate") {
       if (!budget.canRecurseDeeper(brief.depth)) {
-        await reject(round, "delegate", `Max depth (${budget.limits.maxDepth}) reached at this researcher.`);
+        await reject(round, "delegate", `이 리서처에서 최대 깊이(${budget.limits.maxDepth})에 도달했습니다.`);
         continue;
       }
       if (childCallCount >= budget.limits.maxChildCallsPerAgent) {
-        await reject(round, "delegate", `Per-agent child call limit (${budget.limits.maxChildCallsPerAgent}) reached.`);
+        await reject(round, "delegate", `에이전트별 하위 호출 한도(${budget.limits.maxChildCallsPerAgent})에 도달했습니다.`);
         continue;
       }
       const resolved = resolveDelegateTarget(action, currentSurface, candidateRegistry);
@@ -770,14 +770,14 @@ ${selected.markdown}`;
 
     if (action.action === "delegate_parallel") {
       if (!budget.canRecurseDeeper(brief.depth)) {
-        await reject(round, "delegate_parallel", `Max depth (${budget.limits.maxDepth}) reached.`);
+        await reject(round, "delegate_parallel", `최대 깊이(${budget.limits.maxDepth})에 도달했습니다.`);
         continue;
       }
       const remainingPerAgent = budget.limits.maxChildCallsPerAgent - childCallCount;
       const remainingTree = budget.parallelSlotsRemaining();
       const limit = Math.min(remainingPerAgent, remainingTree, budget.limits.maxParallel);
       if (limit <= 0) {
-        await reject(round, "delegate_parallel", `No parallel slots remaining (per-agent or budget exhausted).`);
+        await reject(round, "delegate_parallel", `남은 병렬 슬롯이 없습니다. 에이전트별 한도 또는 전체 예산이 소진되었습니다.`);
         continue;
       }
       const rawBranches = Array.isArray(action.branches) ? action.branches : [];
@@ -797,8 +797,8 @@ ${selected.markdown}`;
           round,
           "delegate_parallel",
           validBranches.length === 0
-            ? `No valid branches (invalid targetIds/startUrls, missing tasks, or all already visited).`
-            : `delegate_parallel requires at least 2 valid branches after filtering; use delegate for a single remaining branch.`,
+            ? `유효한 분기가 없습니다. targetId/startUrl이 잘못되었거나 task가 없거나 모두 이미 방문했습니다.`
+            : `delegate_parallel은 필터링 후 유효한 분기가 최소 2개 필요합니다. 남은 분기가 하나라면 delegate를 사용하세요.`,
         );
         continue;
       }
@@ -815,8 +815,8 @@ ${selected.markdown}`;
           round,
           "delegate_parallel",
           reservedBranches.length === 0
-            ? `No valid branches remained after reservation.`
-            : `delegate_parallel requires at least 2 reserved branches; use delegate for a single remaining branch.`,
+            ? `예약 후 남은 유효 분기가 없습니다.`
+            : `delegate_parallel은 예약된 분기가 최소 2개 필요합니다. 남은 분기가 하나라면 delegate를 사용하세요.`,
         );
         continue;
       }
@@ -853,7 +853,7 @@ ${selected.markdown}`;
     }
 
     // 알 수 없는 action — schema가 막아줄 것이지만 방어적 처리.
-    await reject(round, String(action.action), `Unknown action "${action.action}".`);
+    await reject(round, String(action.action), `알 수 없는 행동입니다: "${action.action}".`);
   }
 
   // 자기 자신의 라운드 한도 소진 — 누적된 정보로 합성을 강제한다.
@@ -863,7 +863,7 @@ ${selected.markdown}`;
     client,
     logger,
     budget,
-    "Per-agent round budget exhausted."
+    "에이전트별 라운드 예산이 소진되었습니다."
   );
 }
 
@@ -878,7 +878,7 @@ async function runChildResearcherSafely(
     return await runResearcher(childBrief, client, logger, budget, candidateRegistry);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    const fallback = buildEmergencyFallback(childBrief, `Child researcher failed: ${detail}`);
+    const fallback = buildEmergencyFallback(childBrief, `하위 리서처 실패: ${detail}`);
     await logger.log("exploration_report", childBrief.agentId, {
       report: { agentId: childBrief.agentId, url: childBrief.startUrl ?? "", answer: fallback, error: detail },
     });
@@ -927,7 +927,7 @@ async function synthesizeFinalAnswer(
 // 페이지 로드 실패 같은 명확한 시스템 에러에도 사용.
 function buildEmergencyFallback(brief: ResearcherBrief, reason: string): string {
   return `ANSWER:
-This researcher could not produce a synthesized answer (${reason}). Goal was: "${brief.goal}".
+이 리서처는 합성 답변을 만들지 못했습니다. 사유: ${reason}. 목표: "${brief.goal}".
 
 SOURCES:
 (none)

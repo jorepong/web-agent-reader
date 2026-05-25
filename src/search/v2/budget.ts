@@ -45,10 +45,10 @@ export class SharedBudget {
   // 사용 가능하면 true 반환 + history 등록 + 카운터 증가.
   reserveSearch(engine: SearchEngine, query: string, page: number): { ok: true } | { ok: false; reason: string } {
     if (this.searchesUsed >= this.limits.maxSearches) {
-      return { ok: false, reason: `Search/paginate limit (${this.limits.maxSearches}) reached.` };
+      return { ok: false, reason: `search/paginate 한도(${this.limits.maxSearches})에 도달했습니다.` };
     }
     if (this.searchHistory.some((h) => h.engine === engine && h.query === query && h.page === page)) {
-      return { ok: false, reason: `Already attempted ${engine}/"${query}" page ${page}.` };
+      return { ok: false, reason: `이미 ${engine}/"${query}" ${page}페이지를 시도했습니다.` };
     }
     this.searchHistory.push({ engine, query, page });
     this.searchesUsed++;
@@ -59,10 +59,10 @@ export class SharedBudget {
   // URL 없는 delegate도 비용을 쓰는 하위 호출이므로 exploresUsed를 증가시킨다.
   reserveDelegate(url?: string): { ok: true } | { ok: false; reason: string } {
     if (this.exploresUsed >= this.limits.maxExplores) {
-      return { ok: false, reason: `Explorer dispatch limit (${this.limits.maxExplores}) reached.` };
+      return { ok: false, reason: `리서처 위임 한도(${this.limits.maxExplores})에 도달했습니다.` };
     }
     if (url && this.visitedUrls.has(url)) {
-      return { ok: false, reason: `${url} was already visited in this session.` };
+      return { ok: false, reason: `${url}은 이 세션에서 이미 방문했습니다.` };
     }
     if (url) this.visitedUrls.add(url);
     this.exploresUsed++;
@@ -85,6 +85,6 @@ export class SharedBudget {
 
   // 디버그 / 메시지 주입용 요약.
   summary(): string {
-    return `rounds ${this.roundsUsed}/${this.limits.maxRounds}, searches ${this.searchesUsed}/${this.limits.maxSearches}, explores ${this.exploresUsed}/${this.limits.maxExplores}`;
+    return `라운드 ${this.roundsUsed}/${this.limits.maxRounds}, 검색 ${this.searchesUsed}/${this.limits.maxSearches}, 위임 ${this.exploresUsed}/${this.limits.maxExplores}`;
   }
 }

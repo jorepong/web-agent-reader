@@ -35,7 +35,7 @@ export function buildSectionedMarkdown(markdown: string): SectionedMarkdown {
   const sections: PageSection[] = [];
 
   if (firstRegionHeading && firstRegionHeading.lineIndex > 0) {
-    const preamble = createSection("S1", "Document Overview", ["Document Overview"], 1, 0, firstRegionHeading.lineIndex, lines);
+    const preamble = createSection("S1", "문서 개요", ["문서 개요"], 1, 0, firstRegionHeading.lineIndex, lines);
     if (preamble.charCount > 0) sections.push(preamble);
   }
 
@@ -57,7 +57,7 @@ export function buildSectionedMarkdown(markdown: string): SectionedMarkdown {
   }
 
   if (sections.length === 0) {
-    sections.push(createSection("S1", "Document", ["Document"], 1, 0, lines.length, lines));
+    sections.push(createSection("S1", "문서", ["문서"], 1, 0, lines.length, lines));
   }
 
   return { markdown, lines, sections };
@@ -67,8 +67,8 @@ export function formatSectionOutline(sections: PageSection[]): string {
   return sections
     .map((section) => {
       const path = section.path.length > 0 ? section.path.join(" > ") : section.title;
-      const preview = section.preview ? ` preview="${section.preview}"` : "";
-      return `[${section.id}] ${path} | level=${section.level} | chars=${section.charCount} | links=${section.linkCount} | tables=${section.tableCount}${preview}`;
+      const preview = section.preview ? ` | 미리보기="${section.preview}"` : "";
+      return `[${section.id}] ${path} | 수준=${section.level} | 글자=${section.charCount} | 링크=${section.linkCount} | 표=${section.tableCount}${preview}`;
     })
     .join("\n");
 }
@@ -166,7 +166,7 @@ function limitMarkdown(markdown: string, selectedIds: string[], maxChars: number
   return {
     markdown:
       markdown.slice(0, maxChars).trimEnd() +
-      `\n\n[Section read truncated at ${maxChars} characters. If the answer remains incomplete, report the missing information in GAPS.]`,
+      `\n\n[섹션 읽기가 ${maxChars}자에서 잘렸습니다. 답변 범위가 불완전하면 부족한 정보를 GAPS에 보고하세요.]`,
     selectedIds,
     truncated: true,
   };
