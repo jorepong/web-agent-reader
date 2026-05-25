@@ -1,6 +1,6 @@
-# Researcher v2 — 통합 재귀 에이전트 설계
+# Researcher v2 — 통합 재귀 에이전트 설계와 현재 구현
 
-이 문서는 v2 작업의 **의도, 기대 결과, 구현 과정**을 본격 구현 전에 정리한 설계 노트다. 작업 진행 중 결정사항이 바뀌면 이 문서를 갱신한다.
+이 문서는 v2 작업의 **의도, 구현 결과, 남은 검토 지점**을 정리한 설계 기록이다. 초안에서 출발했지만, 현재는 `src/search/v2/` 구현에 맞춰 갱신한다.
 
 ---
 
@@ -19,20 +19,21 @@
 
 ## 2. 기대 결과
 
-### 외부 인터페이스 (도구 사용자 관점)
+### CLI / 도구 사용자 관점
 
 ```typescript
-research(goal: string, options?: ResearchOptions): Promise<string>
+research(goal: string): Promise<string>
 ```
 
 - 입력: 자연어 한 줄 (질문 / 검증 요청 / 정보 수집 요청 등)
-- 출력: 템플릿 형식의 자연어 (`ANSWER`, `SOURCES`, `COVERAGE`, `GAPS` 섹션 포함)
-- 외부에서 이 함수 하나만 호출하면 됨. 내부에 두 종류의 에이전트가 있는지 알 필요 없음.
+- 출력: 템플릿 형식의 자연어 (`ANSWER`, `SOURCES`, `COVERAGE`, `GAPS`, `NEXT_CANDIDATES` 섹션 포함)
+- CLI 사용자는 `llm-search --query "..."` 또는 `llm-search-v2 --query "..."`만 호출하면 됨. 내부에 여러 실행 상태가 있는지 알 필요 없음.
+- 코드 레벨의 `research()`는 현재 `OpenAIClient`와 `V2Logger`를 명시적으로 주입받는다.
 
 ### 내부 동작
 
 - 단일 `Researcher` 함수가 자기 자신을 재귀적으로 호출
-- 모든 레벨에서 동일한 액션 집합 (search / paginate / explore / explore_parallel / done) 사용 가능
+- 상태별 스키마가 허용하는 액션 집합 사용: search / paginate / read_sections / delegate / delegate_parallel / done
 - 루트 호출 / 재귀 호출 / 외부 도구 호출이 모두 같은 인터페이스
 - 트리 전체가 공유하는 `SharedBudget`이 비용과 중복 방문을 관리
 
@@ -41,7 +42,7 @@ research(goal: string, options?: ResearchOptions): Promise<string>
 자기유사 재귀로 인해 다음과 같은 행동이 자연스럽게 가능해진다:
 
 - 깊은 레벨의 리서처가 "이 페이지로는 답이 안 됨" 판단 후 *자기 자리에서* 새로 search
-- 탐색 트리 어디에서나 explore_parallel 가능 (이전엔 오케스트레이터 레벨만)
+- 탐색 트리 어디에서나 delegate_parallel 가능 (이전 v1에서는 오케스트레이터 레벨의 explore_parallel만 가능)
 - 부모 리서처가 자식 응답을 자연어로 읽고 후속 행동 결정 → 구조화된 필드 의존도 감소
 - 합성이 별도 단계로 분리되지 않고 루트 리서처의 `done` 행동이 곧 답변
 
@@ -98,17 +99,18 @@ v1의 검증된 가드는 그대로 가져온다:
 다만 다음은 새로 작성:
 - "당신은 리서처입니다 + 자기 자신을 재귀 호출할 수 있다"는 자기유사 설명
 - 루트 vs 비루트 안내 (또는 두 경우의 시스템 프롬프트 통합)
-- 자연어 보고 템플릿 (`ANSWER` / `SOURCES` / `COVERAGE` / `GAPS`)
+- 자연어 보고 템플릿 (`ANSWER` / `SOURCES` / `COVERAGE` / `GAPS` / `NEXT_CANDIDATES`)
 
 ---
 
-## 5. 외부 인터페이스 명세
+## 5. 코드 인터페이스 명세
 
 ```typescript
-// 외부 호출자 입장
 async function research(
   goal: string,
-  options?: ResearchOptions,
+  options: ResearchOptions,
+  client: OpenAIClient,
+  logger: V2Logger,
 ): Promise<string>;
 
 interface ResearchOptions {
@@ -122,7 +124,7 @@ interface BudgetLimits {
   maxRounds: number;       // 트리 전체 LLM 라운드 한도 (제안: 20)
   maxSearches: number;     // 트리 전체 search+paginate 한도 (제안: 8)
   maxExplores: number;     // 트리 전체 explorer 디스패치 한도 (제안: 10)
-  maxParallel: number;     // 한 explore_parallel 배치 동시 디스패치 한도 (제안: 3)
+  maxParallel: number;     // 한 delegate_parallel 배치 동시 디스패치 한도 (제안: 3)
   maxDepth: number;        // 재귀 최대 깊이 (제안: 3)
   maxChildCallsPerAgent: number;  // 한 리서처가 자식 호출 가능 횟수 (제안: 3)
 }
@@ -142,6 +144,9 @@ COVERAGE: <complete | partial | none>
 GAPS:
 - <메우지 못한 정보 항목 1>
 - <메우지 못한 정보 항목 2>
+
+NEXT_CANDIDATES:
+- <부모가 이어서 확인하면 좋은 후보 URL 또는 (none)>
 ```
 
 루트 호출의 출력도 비루트(부모에 보고)의 출력도 같은 형식. 외부 호출자도, 부모 리서처의 LLM도 동일하게 파싱·이해 가능.
@@ -163,11 +168,12 @@ src/search/v2/
 ### 핵심 함수
 
 ```typescript
-// 내부 재귀 단위. 외부 노출용 research()는 이 함수의 얇은 래퍼.
 async function runResearcher(
   brief: ResearcherBrief,
   client: OpenAIClient,
-  logger: DebugLogger,
+  logger: V2Logger,
+  budget: SharedBudget,
+  candidateRegistry?: CandidateRegistry,
 ): Promise<string>;
 
 interface ResearcherBrief {
@@ -175,9 +181,8 @@ interface ResearcherBrief {
   parentAgentId: string | null;
   goal: string;                 // 자연어 목표
   parentGoal: string;           // 원래 사용자 질문 (재귀 깊이와 무관하게 보존)
-  startUrl?: string;            // 있으면 그 URL에서 시작, 없으면 root → 먼저 search 필수
+  startUrl?: string;            // 있으면 그 URL에서 시작, 없으면 URL 없는 리서처
   depth: number;
-  budget: SharedBudget;         // 트리 전체 공유 (참조 전달)
 }
 
 class SharedBudget {
@@ -190,11 +195,11 @@ class SharedBudget {
   exploresUsed: number;
   
   // 체크/예약 API (각 행동 직전에 호출)
-  canSearch(): boolean;
-  canExplore(): boolean;
+  roundsRemaining(): number;
+  consumeRound(): void;
   canRecurseDeeper(currentDepth: number): boolean;
-  reserveSearch(engine, query, page): boolean;  // false면 거부
-  reserveExplore(url): boolean;
+  reserveSearch(engine, query, page): { ok: true } | { ok: false; reason: string };
+  reserveDelegate(url?): { ok: true } | { ok: false; reason: string };
 }
 ```
 
@@ -210,14 +215,14 @@ runResearcher(brief):
   else:
     messages = buildResearcherRootPrompt(brief)
   
-  currentSerp = null
+  currentSurface = null
   
   for round in 0..budget.limits.maxRounds:
     if budget.roundsUsed >= budget.limits.maxRounds:
       break  # 안전망
     budget.roundsUsed++
     
-    schema = pickSchema(brief, currentSerp, budget)  # 동적 스키마 (검색 권한 등)
+    schema = pickSchema(brief, budget, currentSurface, round, childCallCount)  # 동적 스키마
     text = client.complete(messages, schema)
     messages.append(assistant: text)
     
@@ -229,12 +234,12 @@ runResearcher(brief):
       case "search" | "paginate":
         ... (v1 오케스트레이터의 로직 거의 그대로)
         budget.reserveSearch(...) 통과 시에만 실행
-      case "explore":
-        if !budget.reserveExplore(url): reject; continue
+      case "delegate":
+        if !budget.reserveDelegate(url): reject; continue
         childAnswer: string = await runResearcher(childBrief)  # 재귀!
         messages.append(user: child_result_message(childAnswer))
-      case "explore_parallel":
-        ... (Promise.all, 각 branch마다 reserveExplore 체크)
+      case "delegate_parallel":
+        ... (Promise.all, 각 branch마다 reserveDelegate 체크)
       case "done":
         log → return text  # 자연어 답변 그대로 반환
   
@@ -242,32 +247,22 @@ runResearcher(brief):
   return buildFallbackAnswer(brief, messages)
 ```
 
-### 외부 래퍼
+### research 래퍼
 
 ```typescript
-export async function research(goal: string, options: ResearchOptions = {}): Promise<string> {
-  const logger = new DebugLogger(options.debug ?? false, options.logDir ?? ".");
-  await logger.init();
-  
-  try {
-    const client = new OpenAIClient(options.model ?? "gpt-5.4-mini", logger);
-    const budget = new SharedBudget(options.budget);
-    
-    const rootBrief: ResearcherBrief = {
-      agentId: "researcher-root",
-      parentAgentId: null,
-      goal,
-      parentGoal: goal,
-      depth: 0,
-      budget,
-    };
-    
-    return await runResearcher(rootBrief, client, logger);
-  } finally {
-    await logger.finalize();
-  }
+export async function research(
+  goal: string,
+  options: ResearchOptions,
+  client: OpenAIClient,
+  logger: V2Logger
+): Promise<string> {
+  const budget = new SharedBudget(options.budget);
+  const rootBrief = { agentId: "researcher-root", parentAgentId: null, goal, parentGoal: goal, depth: 0 };
+  return runResearcher(rootBrief, client, logger, budget);
 }
 ```
+
+CLI에서는 `cli-runner.ts`가 env/config를 읽고 `V2Logger`, `OpenAIClient`, `ResearchOptions`를 만든 뒤 이 래퍼를 호출한다.
 
 ---
 
@@ -299,8 +294,8 @@ export async function research(goal: string, options: ResearchOptions = {}): Pro
 - v2 모듈이 깨끗하게 컴파일되는지 확인
 
 ### Step 6 — 단위 테스트
-- v1 테스트와 별개 파일 (`test/researcher.test.ts`)
-- 시나리오: search→explore→done / 재귀 시나리오 / 거부 경로 / 한도 도달
+- v1 테스트와 별개 파일 (`test/researcher-v2.test.ts`)
+- 시나리오: root 위임 / 시작 페이지 첫 라운드 제한 / 긴 페이지 섹션 읽기 / delegate_parallel 거부 경로 / 후보 ID 제한 / 한도 도달
 
 ### Step 7 — 통합 점검
 - 실제 CLI로 한 번 돌려서 동작 확인 (사용자가 수행)
@@ -328,14 +323,14 @@ export async function research(goal: string, options: ResearchOptions = {}): Pro
 
 본 단위에서는 다음을 *결정하고 진행*:
 
-- **루트와 비루트의 시스템 프롬프트를 통합할지 분기할지**: 일단 분기로 구현 (루트는 search 권한 명시, 비루트는 페이지 분석 우선). 통합은 후속 단계에서 검토.
-- **자연어 보고 템플릿의 정확한 형식**: `ANSWER / SOURCES / COVERAGE / GAPS` 4섹션. 부모 LLM이 이를 읽고 후속 행동 판단 가능하도록 프롬프트 가이드 제공.
-- **MAX_DEPTH 기본값**: 3 (Google → 카테고리 → 리스트 → 항목 수준).
+- **루트와 비루트의 시스템 프롬프트를 통합할지 분기할지**: 시스템 프롬프트는 통합하고, 루트/서브/시작 페이지 보유 여부는 초기 메시지와 상태별 스키마로 구분한다.
+- **자연어 보고 템플릿의 정확한 형식**: `ANSWER / SOURCES / COVERAGE / GAPS / NEXT_CANDIDATES` 섹션. 부모 LLM이 이를 읽고 후속 행동 판단 가능하도록 프롬프트 가이드 제공.
+- **maxDepth 기본값**: 코드 기본값은 3, 현재 저장소 config 기준 v2 실행값은 5.
 
 본 단위에서 *미루는* 결정:
 - v2가 안정화되면 v1 deprecation 여부 — 별도 결정.
 - MCP 서버 노출 — 별도 작업.
-- 평가 하네스 (IMPROVEMENTS.md ★★★) — v1/v2 양쪽 모두에서 평가할 수 있도록 별도 작업.
+- 평가 하네스 (`TODO.md`) — v1/v2 양쪽 모두에서 평가할 수 있도록 별도 작업.
 - v1과 v2 사이 인터페이스 호환성 (예: v2가 v1 ExplorationReport를 받아 처리할 수 있어야 하는가) — 불필요. 둘은 독립적.
 
 ---
@@ -358,11 +353,13 @@ export async function research(goal: string, options: ResearchOptions = {}): Pro
 
 ```
 src/search/v2/
-  types.ts       — 67줄. ResearchOptions / BudgetLimits / ResearcherBrief / LLMMessage / CurrentSerp
-  budget.ts      — 80줄. SharedBudget 클래스 (reserveSearch/reserveExplore/canRecurseDeeper 등)
-  prompts.ts     — 270줄. 5종 액션 스키마(decision 래핑) + 시스템 프롬프트 + 결과 메시지 빌더
-  researcher.ts  — 380줄. runResearcher 재귀 본체 + research() 외부 래퍼
-  cli.ts         — 70줄. node dist/search/v2/cli.js 진입점
+  types.ts       — ResearchOptions / BudgetLimits / ResearcherBrief / CurrentSurface / CandidateLink
+  budget.ts      — SharedBudget 클래스 (reserveSearch/reserveDelegate/canRecurseDeeper 등)
+  sections.ts    — 긴 마크다운 페이지 섹션 인덱싱과 선택 읽기
+  prompts.ts     — 상태별 액션 스키마(decision 래핑) + 시스템 프롬프트 + 결과 메시지 빌더
+  researcher.ts  — runResearcher 재귀 본체 + research() 외부 래퍼
+  logger.ts      — V2Logger
+  cli.ts         — node dist/search/v2/cli.js 진입점
 ```
 
 ### 동작 확인 사항
@@ -374,16 +371,16 @@ src/search/v2/
 ### 알려진 단순화 / 결정 사항
 
 1. **paginate는 search 컨텍스트에서만 동작** — 자식 리서처가 페이지에서 시작한 경우 paginate는 거부됨 (의미상 SERP가 아닌 일반 페이지를 paginate할 수 없음).
-2. **자식 페이지도 currentSerp로 통합 관리** — explore/explore_parallel이 SERP 링크와 페이지 링크를 동일한 메커니즘으로 다룬다.
-3. **자식 답변은 자연어 그대로 부모 messages에 append** — 별도 구조화 파싱 없음. 부모 LLM이 ANSWER/SOURCES/COVERAGE/GAPS 템플릿을 읽고 후속 행동 판단.
+2. **SERP와 페이지를 CurrentSurface로 통합 관리** — delegate/delegate_parallel이 SERP 후보와 페이지 링크 후보를 동일한 메커니즘으로 다룬다.
+3. **자식 답변은 자연어 그대로 부모 messages에 append** — 별도 구조화 파싱 없음. 부모 LLM이 ANSWER/SOURCES/COVERAGE/GAPS/NEXT_CANDIDATES 템플릿을 읽고 후속 행동 판단.
 4. **per-agent 라운드 상한 = maxChildCallsPerAgent + 3** — 자식 호출 + 초기 + 마지막 done + 여유 1.
 5. **트리 전체 라운드 한도 + 개별 에이전트 라운드 한도 이중 제한**.
 
 ### 다음 단계 (별도 작업)
 
-- v2용 시나리오 테스트 추가 (`test/researcher.test.ts`)
+- v2용 시나리오 테스트 확장 (`test/researcher-v2.test.ts`)
 - 동일 쿼리에서 v1 vs v2 비용·품질 비교
-- 평가 하네스 도입 (IMPROVEMENTS.md ★★★)
+- 평가 하네스 도입 (`TODO.md`)
 - v2 안정화 시 v1 deprecation 여부 결정
 
 ---
@@ -405,16 +402,16 @@ src/search/v2/
 - **V2Logger 신규 작성** (`src/search/v2/logger.ts`) — v2 페이로드 필드(`startUrl`, `answer`, `forced` 등)에 맞춘 stderr 출력. `DebugLogger`를 `super(false, ...)`로 무력화시켜 상속하면서 `OpenAIClient`의 `DebugLogger` 타입 요구와 호환.
 - **한도 도달 시 `synthesizeFinalAnswer` 호출** — 트리/에이전트 라운드 한도 도달 시 LLM을 한 번 더 호출(`buildDoneOnlySchema`)해 누적 messages로 답변 합성. 빈손으로 끝나지 않음.
 - **`buildEmergencyFallback`** — LLM 합성 호출 자체가 실패한 경우의 최후 폴백.
-- **자식 초기 프롬프트 강화** — "Your first action MUST analyze THIS PAGE: ... Do NOT choose search as your first action."
+- **시작 페이지 첫 라운드 스키마 제한** — `buildStartPageFirstSchema`로 시작 페이지를 받은 리서처의 첫 행동에서 search/paginate를 제거.
 
 ### 2차 실행 — 잔존 / 새 패턴
 
-1. **(잔존) 로그 답변 미리보기가 템플릿 헤더 `ANSWER:`만 표시** — `firstNonEmpty` 추출이 답변의 *literal 첫 줄*인 `ANSWER:`를 잡음. 답변 본문 한 줄도 안 보임.
+1. **(해결) 로그 답변 미리보기** — `previewAnswerLine`이 `ANSWER:` 헤더 다음 첫 내용 줄을 표시하도록 수정됨.
 2. **(신규) 죽은/빈 시작 페이지(227자, 사실상 404)에서 search 무한 루프** — Profit 페이지에서 위임된 손자 리서처가 6회 search 후 강제 합성. 시작 페이지 분석 우선 규칙이 *유효한 페이지가 주어졌을 때*만 발휘되고, *죽은 페이지가 주어진 경우*에 대한 가드 없음.
-3. **(신규) 첫 행동 분석 규칙이 우회됨** — 모델이 합리적 이유(현재 페이지가 다른 권위 출처를 참조)를 만들어 첫 행동을 search로 빠짐. 프롬프트만으로는 강제력 부족.
+3. **(해결) 첫 행동 분석 규칙 우회** — 시작 페이지 첫 라운드에서 search가 스키마로 차단됨.
 4. **(부산물) 루트가 자식 보고 후 자기 결정 기회를 못 받음** — 자식 트리가 트리 라운드 한도 대부분을 소비. 강제 합성 답변은 정상 생성됨(자식 보고로 만든 답변이 합리적).
 
-2번/3번이 핵심 잔존 이슈. 4번은 2번 해결 시 자연 해소될 가능성.
+현재 핵심 잔존 이슈는 dead/empty page에서 불필요한 후속 search가 길어질 수 있다는 점이다. search saturation 가드는 추가 평가 후 도입한다.
 
 ---
 
@@ -438,13 +435,13 @@ src/search/v2/
 각 리서처는 *깊은 읽기*를 한 번만 한다 (자기 `startUrl`). 추가 페이지 깊이 읽기는 모두 자식에게 위임.
 
 - 같은 에이전트에서 페이지 두 개를 직접 로드하면 컨텍스트 30+30=60KB 누적 → 무한히 자라남.
-- `explore` 액션이 *위임*이지 *직접 로드*가 아니므로, 이 원칙은 v2의 구조에서 이미 자동으로 지켜진다.
+- `delegate` 액션이 *위임*이지 *직접 로드*가 아니므로, 이 원칙은 v2의 구조에서 이미 자동으로 지켜진다.
 - 검색(SERP 읽기)은 얕은 읽기라 여러 번 해도 누적 비용이 작다. 다만 *불필요한* search 반복은 라운드 낭비.
 
 ### 13-3. 루트의 "초기 조건" ≠ 비대칭
 
 루트와 자식은 *같은 함수*다. 차이는 입력의 초기 조건:
-- 루트: `startUrl: undefined` → 첫 행동은 search 강제 (스키마로 제한)
+- 루트: `startUrl: undefined`, `parentAgentId: null` → 첫 행동은 delegate/delegate_parallel 강제 (스키마로 제한)
 - 자식: `startUrl: <url>` → 페이지 로드 후 분석 우선
 
 이건 함수가 다른 것이 아니라 *입력이 다른* 것. 재귀 본질을 깨지 않는다.
@@ -461,15 +458,15 @@ src/search/v2/
 
 ### 13-5. 무한 위임은 구조적으로 차단됨
 
-`MAX_DEPTH`가 잎 노드 깊이를 막는다. 잎(depth=MAX_DEPTH) 리서처는 schema에서 explore 옵션이 제거되어 *반드시* 자기 페이지를 분석하고 done. 따라서 "모든 에이전트가 위임만 한다" 시나리오는 발생 불가.
+`maxDepth`가 잎 노드 깊이를 막는다. 잎(depth=maxDepth) 리서처는 schema에서 delegate/delegate_parallel 옵션이 제거되어 현재 표면에서 가능한 읽기와 done만 수행한다. 따라서 "모든 에이전트가 위임만 한다" 시나리오는 구조적으로 차단된다.
 
 위에서 추상적으로 사고하는 에이전트와 아래에서 실제 페이지를 분석하는 에이전트가 자연스럽게 분업된다.
 
 ---
 
-## 14. 다음 작업 우선순위 (2차 사이클)
+## 14. 다음 작업 우선순위
 
-2차 실행에서 발견된 잔존 이슈를 해결하기 위해, 다음 가드들을 검토:
+남은 품질 이슈를 해결하기 위해 다음 가드들을 검토:
 
 ### A. Dead-page 가드 (★★★ 핵심 잔존 이슈)
 
@@ -479,7 +476,7 @@ src/search/v2/
 
 ### B. Search saturation 가드 (★★)
 
-같은 리서처가 N회(예: 2회) 연속 search 후에도 explore를 안 하면, 다음 라운드의 schema에서 search/paginate 제외 → explore 또는 done만 가능.
+같은 리서처가 N회(예: 2회) 연속 search 후에도 delegate나 done으로 전환하지 않으면, 다음 라운드의 schema에서 search/paginate 제외 → delegate 또는 done만 가능.
 
 행동 패턴 자체를 schema로 강제. 프롬프트는 비결정적이라 우회됐던 사례들(2차 실행 #3) 보완.
 
@@ -491,15 +488,10 @@ src/search/v2/
 
 부모-자식 책임 분담을 명시. 자식이 자기 영역을 넘어 추적하지 않도록.
 
-### D. 로그 답변 미리보기 버그 수정 (★ 단순 버그)
-
-V2Logger의 `exploration_report` 핸들러에서 `ANSWER:` 헤더 다음 첫 *내용* 줄을 추출. 정규식 또는 헤더 스킵 로직.
-
 ### 적용 순서 권장
 
-1. **D (로그 미리보기)** — 한 줄 수정, 즉시 디버깅 가능성 회복
-2. **A (Dead-page 가드)** — Profit-l195 루프 직접 차단
-3. **C (자식 책임 경계 프롬프트)** — 자식이 자기 영역 지키도록 유도
-4. **B (Search saturation schema)** — 위 셋으로 부족할 때의 hard guarantee
+1. **A (Dead-page 가드)** — dead/empty page 루프 직접 차단
+2. **C (자식 책임 경계 프롬프트)** — 자식이 자기 영역 지키도록 유도
+3. **B (Search saturation schema)** — 위 둘로 부족할 때의 hard guarantee
 
 A+C는 보완 관계. A는 *시작 페이지가 명백히 죽었을 때*만 발동하지만, C는 *일반적인 경우*에도 자식의 search 욕망을 누름. 둘 다 도입이 자연스럽다.

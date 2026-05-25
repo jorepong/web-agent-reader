@@ -1,296 +1,124 @@
-# LLM Search Tool — 설계 문서 및 구현 로드맵
+# TODO.md — 로드맵과 개선 후보
+
+현재 작업 후보와 개선 아이디어를 한 곳에서 관리합니다.
 
 ---
 
-## 1. 이 도구가 하는 일
+## 현재 상태 요약
 
-사용자가 질문이나 검색을 요청하면, LLM이 자율적으로 웹을 탐색하여 정보를 수집하고 최종 답변을 반환하는 CLI 도구.
+`llm-search`는 v1과 v2가 공존합니다. 프로젝트 루트의 `llm-search.config.json` 기본 버전은 `v2`입니다.
 
-기존 llm-page-reader(웹 페이지를 LLM이 읽기 좋은 마크다운으로 변환하는 라이브러리) 위에 구축된다.
+v1은 오케스트레이터와 탐색 에이전트를 분리한 구조입니다. 오케스트레이터는 `search`, `paginate`, `explore`, `explore_parallel`, `done` 행동 루프를 수행하고, explorer는 시작 URL 하나를 깊게 읽으며 필요하면 페이지 내부 링크를 따라 자식 explorer를 직렬 호출합니다.
 
-실행 방법:
-```bash
-node dist/search/cli.js --query "질문" [--debug] [--log-dir ./logs] [--model gpt-5.4-mini] [--env .env]
-```
+v2는 단일 재귀 `Researcher` 구조입니다. 루트, URL 없는 서브 리서처, 시작 페이지가 있는 리서처가 모두 같은 함수(`runResearcher`)로 실행되며, 상태별 스키마가 `search`, `paginate`, `read_sections`, `delegate`, `delegate_parallel`, `done` 중 가능한 행동만 허용합니다.
 
----
+현재 검증 상태:
 
-## 2. 핵심 설계 철학
-
-### 2-1. 계층적 에이전트 구조
-
-```
-최상위 에이전트 (오케스트레이터)
-  └── 탐색 에이전트 (explorer)
-        └── 하위 탐색 에이전트 (재귀, Phase 2~)
-              └── ...
-```
-
-- **오케스트레이터**: 사용자 쿼리 수신 → 검색 수행 → 탐색 에이전트 지시 → 결과 종합 → 최종 응답
-- **탐색 에이전트**: 페이지 변환 → LLM으로 정보 추출 → 더 깊이 탐색할지 판단 → 상위에 보고
-
-### 2-2. LLM이 탐색 너비와 깊이를 자율 판단
-
-- 사전에 "몇 개 페이지를 탐색할지" 고정하지 않는다
-- 매 탐색 후 LLM이 판단: "충분한 정보를 얻었는가? 아니면 더 탐색해야 하는가?"
-- 중복 정보가 반복되거나 관련성이 낮아지면 스스로 종료
-- 하드 리밋(최대 깊이, 최대 페이지 수)은 비용 폭발 방지용 안전장치로만 사용
-
-### 2-3. 에이전트 간 정보 전달 원칙
-
-**상위 → 하위 (미션 브리핑)**:
-- 간결하게. 자식 에이전트가 독립적으로 판단할 수 있는 최소한의 정보만 전달
-- 포함 내용: 탐색 목표(goal), 탐색할 URL, 원래 사용자 쿼리(parentGoal), 깊이 제한
-
-**하위 → 상위 (탐색 보고)**:
-- 맥락과 행동이 손실되지 않을 정도로 충분하게
-- 포함 내용: 탐색한 URL, 발견 여부, 요약, 핵심 발췌문, 토큰 사용량
-
-**부모 에이전트의 컨텍스트 구조**:
-- 하위 보고를 받을 때 기존 컨텍스트를 재구성하지 않고 append만 함
-- 이렇게 해야 prefix cache 히트율이 유지됨 (OpenAI prompt caching 대응)
-- 자식 에이전트는 매번 새로 시작하므로 캐시 이점 없음 → 미션 브리핑을 짧게 유지하는 이유
-
-### 2-4. 병렬 vs 직렬
-
-- 독립적인 탐색 브랜치(결과와 무관하게 병렬로 탐색 가능)는 병렬 호출
-- 이전 탐색 결과에 따라 다음 탐색이 결정되는 경우는 직렬
-- 어떤 것이 병렬 가능한지도 LLM이 판단
+- `npm run build` 통과
+- `npm test` 통과
+- v2 테스트 파일: `test/researcher-v2.test.ts`
 
 ---
 
-## 3. 현재 구현 상태 (Phase 1 완료 / Phase 2 진행 중)
+## v1 로드맵
 
-### 파일 구조
+| Phase | 상태 | 내용 |
+|---|---|---|
+| 1 | 완료 | 단일 깊이 직렬 탐색 CLI |
+| 2 | 완료 | 탐색 에이전트 아젠틱 루프 |
+| 3 | 완료 | 오케스트레이터 레벨 병렬 에이전트 호출 (`explore_parallel`) |
+| 4 | 완료 | 오케스트레이터 자율 행동 루프 (`search/paginate/explore/explore_parallel/done`) |
+| 5 | 일부 완료 | CLI 옵션 고도화. config 기반 한도 조정과 v1/v2 선택은 구현됨. 추가 UX 옵션은 남아 있음. |
 
-```
-src/search/
-  types.ts          — 공유 타입 정의
-  logger.ts         — 디버그 로거 (JSON 트리 구조)
-  openai-client.ts  — OpenAI SDK 래퍼
-  prompts.ts        — 모든 LLM 프롬프트
-  explorer.ts       — 탐색 에이전트
-  orchestrator.ts   — 오케스트레이터
-  cli.ts            — CLI 진입점
-src/cli-utils.ts    — CLI 파싱 헬퍼 (option, intOption, required)
-```
-
-### Phase 1 동작 흐름
-
-```
-사용자 쿼리
-  → [LLM] 검색 쿼리 생성 (한국어 → 영어 등 최적화)
-  → Google SERP 변환 (convertPage, stealth=true, scroll=false)
-  → 루프 (최대 MAX_PAGES=5회):
-      [LLM] 판단: 더 탐색할지(explore) vs 종료(done)?
-        - explore → 선택한 링크 URL로 탐색 에이전트 실행
-            → convertPage(url, stealth=true, scroll=true)
-            → [LLM] 관련 정보 추출 → ExplorationReport 반환
-        - done → 루프 종료
-  → [LLM] 수집된 보고들로 최종 답변 합성
-  → stdout 출력
-```
-
-### 특이 동작: SERP 기반 합성
-
-SERP 자체에서 충분한 정보를 얻은 경우(단순 사실 질문 등) LLM이 1라운드에서 "done"을 결정할 수 있음.
-이 경우 탐색 없이 SERP 스니펫으로 바로 합성.
-- SERP 기반 합성 시 출처 URL 인용 금지 (실제 방문하지 않았으므로)
-- 페이지 탐색 기반 합성 시 출처 URL 인용 가능
-
-### 토큰 효율화 (구현됨)
-
-- **SERP → 판단 루프**: `extractSerpSnippets()` 적용. 네비게이션/푸터/링크ID 제거, Main Content 스니펫만 전달. 루프 진입 전 한 번만 실행, 매 라운드 재사용
-- **SERP → 합성**: 위와 동일하게 스니펫만 전달
-
-### 디버그 로그
-
-`--debug` 플래그 활성화 시 `--log-dir` 경로에 JSON 파일 생성.
-
-구조: 에이전트 계층을 반영한 트리 JSON
-```json
-{
-  "agentId": "orchestrator",
-  "depth": 0,
-  "events": [ ... ],
-  "children": [
-    {
-      "agentId": "explorer-1",
-      "depth": 1,
-      "events": [ ... ],
-      "children": []
-    }
-  ]
-}
-```
-
-기록 이벤트 종류:
-- `llm_request` / `llm_response` — LLM 호출 입출력 + 토큰 사용량
-- `page_markdown` — convertPage로 변환된 페이지 전문
-- `mission_brief` — 상위 → 하위 에이전트 지시
-- `exploration_report` — 하위 → 상위 에이전트 보고
-- `orchestrator_plan` — 오케스트레이터의 매 라운드 판단 (explore/done)
-- `final_answer` — 최종 답변
-
-터미널 실시간 출력 (stderr): 에이전트 동작 상황을 한국어로 표시
+v1은 안정 구조로 보존합니다. 구조 설명은 `ARCHITECTURE.md`가 v1 기준 명세입니다.
 
 ---
 
+## v2 로드맵
 
-## 5. Phase 2: 재귀 탐색
+| 단계 | 상태 | 내용 |
+|---|---|---|
+| 설계 문서화 | 완료 | `RESEARCHER_V2.md` 작성 |
+| 핵심 구조 구현 | 완료 | `types/budget/sections/prompts/researcher/logger/cli` |
+| 통합 CLI 연결 | 완료 | `llm-search`, `llm-search-v1`, `llm-search-v2`, `--version`, config 지원 |
+| 자동 테스트 | 완료 | `test/researcher-v2.test.ts` |
+| 긴 페이지 섹션 읽기 | 완료 | 섹션 선택 + `read_sections` 액션 |
+| 후보 ID 안정화 | 완료 | `[L*]`를 `[C*]` 후보 ID로 재매핑하고 스키마 enum으로 제한 |
+| v1 deprecation 결정 | 대기 | v2 실사용 안정화 후 결정 |
 
-**목표**: 각 탐색 에이전트가 오케스트레이터와 동일한 구조의 아젠틱 루프를 실행한다. 자식 에이전트를 필요에 따라 반복 호출하고, 수집한 정보를 자율적으로 선별·통합해 단일 보고를 상위에 반환한다.
-
----
-
-### 설계: 탐색 에이전트 아젠틱 루프
-
-탐색 에이전트는 고정된 1회성 작업자가 아니라, 오케스트레이터와 동일한 루프 구조를 갖는 **미니 오케스트레이터**다.
-
-```
-[Explorer, depth=N]
-  1. convertPage(url) → 페이지 마크다운 획득
-  2. 초기 messages 구성: [system, user(goal + page_markdown)]
-  3. 루프 (최대 MAX_CHILD_CALLS_PER_AGENT=3회):
-       [LLM] 판단:
-         explore(linkId, rationale)
-           → 해당 링크로 자식 에이전트 실행 (depth=N+1)
-           → 자식 ExplorationReport 수신
-           → messages에 자식 보고 append (messages 재구성 금지)
-           → 루프 계속
-         done(found, summary, relevantExcerpts)
-           → 루프 종료
-           → ExplorationReport 반환 (부모에게)
-  ※ depth >= MAX_DEPTH 이면 explore 판단이 나와도 자식 호출 안 함, 즉시 done으로 처리
-```
-
-**핵심 원칙**:
-- 자식 보고를 상위 에이전트가 직접 보지 않는다. 깊이 N+1의 보고는 깊이 N 에이전트에게만 전달된다.
-- 깊이 N 에이전트는 자신의 목적 기준으로 자식 보고를 평가하고, 관련 있는 내용만 자신의 `summary`에 통합한다. 자식 보고 전체를 상위에 올리지 않는다.
-- 오케스트레이터는 `flattenReports` 없이 최상위 explorer의 단일 보고만 수신한다.
-- 컨텍스트 append만 허용 (재구성 금지): 자식 보고를 받을 때마다 기존 messages 배열 끝에 추가. prefix cache 히트율 유지 목적.
-- 하드 리밋(MAX_DEPTH, MAX_CHILD_CALLS_PER_AGENT)은 비용 폭발 방지 안전장치일 뿐, 탐색 구조를 규정하지 않는다.
-
-**탐색 종료 조건** (LLM 자율 판단):
-- 목표에 충분한 정보를 확보했을 때
-- 탐색할 만한 관련 링크가 없을 때
-- 자식 에이전트가 반복적으로 무관한 정보만 가져올 때
-- 하드 리밋 도달 (강제 종료)
+현재 설정 파일 기준 v2 한도는 `maxRounds=30`, `maxSearches=20`, `maxExplores=20`, `maxParallel=3`, `maxDepth=5`, `maxChildCallsPerAgent=3`입니다. 설정 파일이 없을 때 코드 기본값은 `20/8/10/3/3/3`입니다.
 
 ---
 
-### 현재 구현 상태 (완료)
+## 우선순위 높은 작업
 
-- [x] `MissionBrief`에 `depth` 필드 추가
-- [x] 탐색 에이전트 내 `visitedUrls` 중복 방지 로직
-- [x] explorer를 아젠틱 루프 구조로 재구현 (`explorer.ts`)
-  - 페이지 변환 후 초기 messages 배열 구성
-  - 루프: LLM 호출 → `explore(linkId)` 또는 `done(summary)` 판단
-  - `explore`: 자식 에이전트 호출, 보고 수신, messages에 자식 보고 append (재구성 금지)
-  - `done`: `ExplorationReport` 반환 (자식 결과를 선별 통합한 summary 포함)
-  - `depth >= MAX_DEPTH` 시 "탐색 불가" 메시지 주입 → LLM이 done 반환하도록 유도
-- [x] 새 프롬프트 함수 추가 (`prompts.ts`)
-  - `buildExplorerInitialPrompt(brief, pageMarkdown)`
-  - `buildExplorerContinueMessage(childReport, canExploreMore)`
-  - 기존 `buildExplorerPrompt` 제거
-- [x] orchestrator에서 `flattenReports` 제거 (`orchestrator.ts`)
-- [x] `ExplorationReport`에서 `childReports` 필드 제거 (`types.ts`)
-- [x] 하드코딩 상수:
-  - `MAX_DEPTH = 2` (Phase 5에서 옵션화)
-  - `MAX_CHILD_CALLS_PER_AGENT = 3` (Phase 5에서 옵션화)
-- [x] logger의 `children` 구조가 재귀 깊이를 자동 반영함
+### 1. 평가 하네스 도입
 
----
+다양한 질문 셋을 만들고 핵심 항목 포함 여부를 자동 채점합니다. 단일 사실, list/history, 시기 한정, 한국어 도메인, 영문 기술 질문을 포함한 10~30개 정도의 회귀 세트가 필요합니다.
 
-## 6. Phase 3: 병렬 호출 (완료)
+효과: 프롬프트와 구조 변경이 어떤 시나리오를 개선하거나 악화시키는지 정량적으로 볼 수 있습니다.
 
-**목표**: 독립적인 탐색 브랜치를 동시에 실행해 전체 탐색 시간을 줄인다.
+### 2. Logger payload 스냅샷화
 
-**설계 원칙**:
-- 병렬 가능 조건: 탐색 결과와 무관하게 독립적으로 진행 가능한 경우
-- 직렬 유지 조건: 이전 탐색 결과를 보고 다음 탐색 대상을 결정해야 하는 경우
-- 어떤 것을 병렬로 실행할지도 LLM이 판단
+현재 logger는 messages 배열 자체는 새 배열로 넘기지만 payload 전체를 깊게 스냅샷하지 않습니다. 큰 mutable payload를 어느 시점의 입력으로 정확히 보존하려면 선택적 deep copy나 별도 raw 파일 저장 전략이 필요합니다.
 
-**현재 구현 상태 (오케스트레이터 레벨)**:
-- [x] 오케스트레이터 프롬프트에 `explore_parallel` 액션 추가 — LLM이 한 라운드에서 2-`MAX_PARALLEL`개의 독립 브랜치를 선택
-- [x] `Promise.all` 기반 병렬 explorer 실행 (`orchestrator.ts`)
-- [x] 병렬 보고 결과 수집 및 병합 (`reports.push(...parallelReports)`)
-- [x] `MAX_PARALLEL = 3` 상수 (`prompts.ts`) — Phase 5에서 `--max-parallel`로 옵션화 예정
-- [x] 루프 상한 이중화: `round ≤ MAX_PAGES` AND `exploredUrls.length < MAX_PAGES` (병렬 배치가 페이지 예산을 더 빨리 소진)
-- [x] 같은 배치 내 URL/linkId 중복 차단, 무효 branch 전부 폴백 시 `continue`로 다음 라운드 유도
-- [x] `orchestrator_plan` 로그에 `branches[]` 페이로드 추가, stderr 출력도 분기 처리
+효과: 라운드별 LLM 입력을 사후 분석하기 쉬워집니다.
 
-**남은 검토 항목**:
-- [ ] 탐색 에이전트(explorer) 내부 자식 호출 병렬화는 별도 작업 (Phase 3에서는 오케스트레이터 레벨만 다룸)
-- [ ] Playwright 브라우저 동시 실행 시 메모리 사용량 모니터링 — 실사용 케이스에서 관찰 필요
+### 3. v2 자식 책임 경계 평가
+
+v2는 시작 페이지가 있는 리서처의 첫 라운드 search를 스키마로 차단합니다. 그래도 이후 라운드에서 search가 열릴 수 있으므로, “시작 페이지와 연결 문맥을 확인하고 안 되면 부모에게 보고”하는 책임 경계가 실제로 지켜지는지 평가해야 합니다.
+
+후보 작업:
+
+- 같은 리서처가 연속 search만 반복할 때 `search/paginate`를 잠시 닫는 saturation 가드
+- dead page 감지 후 빠른 `COVERAGE: none` 유도
+- 자식 보고에서 `NEXT_CANDIDATES`를 더 안정적으로 활용하는 부모 프롬프트 보강
+
+### 4. v1 Explorer 트리 간 URL 공유
+
+v1은 오케스트레이터 레벨 `exploredUrls`와 각 explorer 트리 내부 `visitedUrls`가 분리되어 있습니다. 서로 다른 explorer 트리에서 같은 URL을 다시 변환할 수 있습니다.
+
+후보 구현: `runSearch` 안에서 단일 `Set<string>`을 만들고 모든 `runExplorationAgent` 호출에 주입합니다.
+
+### 5. 부모 explorer 컨텍스트 슬림화
+
+v1 explorer는 첫 user 메시지에 raw 페이지 본문을 크게 넣고, 자식 호출 후에도 그 본문이 prefix에 남습니다. 첫 자식 보고 이후에는 페이지 개요와 링크 인덱스로 압축하는 방안을 검토합니다.
+
+효과: 큰 페이지에서 explorer 라운드 비용을 줄일 수 있습니다.
 
 ---
 
-## 7. Phase 4: 오케스트레이터 자율 행동 루프 (완료)
+## 품질 / 정확성 개선 후보
 
-**목표**: 오케스트레이터를 "SERP 1회 → 링크 루프"의 고정 구조에서 벗어나, 행동(action) 집합 위에서 도는 에이전틱 루프로 전환. 검색 엔진/쿼리/페이지/탐색 대상 모두 LLM이 자율 판단. 원안의 "지능적 종료 강화"는 이 루프 안에 자연스럽게 흡수됨 — LLM이 종료 시점을 휴리스틱(정보 충분/반복 실패/관련성 하락)으로 결정.
-
-**핵심 설계**:
-- 행동 5종: `search(engine, query)` / `paginate(page)` / `explore(linkId, task)` / `explore_parallel(branches[])` / `done(reason)`
-- 매 라운드 LLM이 행동 1개 결정 → 시스템 실행 → 결과를 messages 끝에 append-only
-- 무효한 입력(JSON 파싱 실패, 무효 linkId, 한도 초과, 중복 검색)은 에러 메시지 주입 후 다음 라운드에서 재선택
-- append-only 원칙으로 OpenAI prefix cache 히트율 유지 → 많은 행동을 해도 라운드당 토큰 비용 작음
-
-**현재 구현 상태 (완료)**:
-- [x] `src/search/search-engines.ts` — google/bing/naver SERP URL 빌더 (페이지네이션 포함)
-- [x] `buildOrchestratorInitialPrompt` 등 새 프롬프트 함수 (`prompts.ts`) — 기존 `buildSearchQueryPrompt`, `buildNextActionPrompt` 제거
-- [x] `orchestrator.ts` 에이전틱 루프로 전면 재작성
-- [x] 하드 리밋:
-  - `ORCHESTRATOR_MAX_ROUNDS = 12` — 전체 라운드 상한
-  - `ORCHESTRATOR_MAX_SEARCHES = 5` — search + paginate 합계
-  - `ORCHESTRATOR_MAX_EXPLORES = 5` — explorer 누적 디스패치 (병렬 1배치 = 각각 카운트)
-  - `MAX_PARALLEL = 3` — 한 explore_parallel 배치 내 동시 디스패치
-- [x] 같은 (engine, query, page) 삼중쌍 재검색 차단
-- [x] SERP 변환 실패 시도 history에 기록 (같은 실패 쿼리 무한 재시도 방지)
-- [x] 합성 폴백 분기 확장: explorer 보고 없음 → 마지막 SERP / SERP도 없음 → "no data" 보고
-- [x] logger stderr 출력에 search/paginate/explore/explore_parallel/error 분기 추가
-- [x] 시나리오 테스트 추가 (search→explore, 엔진 전환 재검색, paginate, parallel, SERP 없이 explore 시 에러 주입 복구)
-
-**남은 검토 항목 (별도 작업)**:
-- [ ] 탐색 에이전트(explorer) 내부 자식 호출 병렬화 — 현재는 직렬, append-only 캐시 키 안정화 설계 필요
-- [ ] DuckDuckGo / 도메인 특화 소스(arXiv, Stack Overflow, github) 추가
-- [ ] 검색 결과 캐싱 — 동일 (engine, query, page)의 SERP를 세션 간 재사용
-- [ ] 토큰 사용량 집계 — 현재 explorer 보고에는 있지만 오케스트레이터 라운드별 누적은 미집계
+- Partial 보고 후속 시도 상한: 같은 missingInfo를 무한히 추적하지 않도록 동일 갭에 대한 후속 시도를 제한합니다.
+- 엔티티 리브랜딩/분할 의심 가드: history/list 질문에서 시기별 페이지 분리나 리브랜딩 가능성을 점검합니다.
+- `site:` 연산자 권장: 권위 도메인이 명확한 경우 검색 쿼리를 좁히도록 유도합니다.
+- Query 시기 한정 가드: “이번 주”, “최근”, 특정 연도 질문에서 날짜·연도·검색 연산자 사용을 더 일관되게 유도합니다.
+- 답변 신뢰도 메타데이터: 방문 페이지 수, useful report 수, unresolved gap 수를 최종 답변 주변에 표시할지 검토합니다.
 
 ---
 
-## 8. Phase 5: 옵션 고도화
+## 효율 / 안정성 개선 후보
 
-**목표**: 비용·속도 제어를 사용자가 CLI 옵션으로 조정할 수 있게 한다.
-
-**구현 항목**:
-- [ ] `--max-depth N` — 재귀 최대 깊이 (기본값: 2)
-- [ ] `--max-pages N` — 전체 변환 페이지 수 상한 (기본값: 5)
-- [ ] `--max-parallel N` — 최대 병렬 호출 수 (기본값: 3)
-- [ ] `--timeout N` — 전체 탐색 타임아웃 초 (기본값: 없음)
-- [ ] 이 값들을 `MissionBrief`에 포함시켜 에이전트가 자기 제한을 인식하게 함
-- [ ] `SearchOptions` 타입에 위 필드들 추가
+- v1 explorer 레벨 `explore_parallel`: v1 explorer 내부 자식 호출은 현재 직렬입니다. fan-out 검증 시나리오에서 병렬화 가능성이 있습니다.
+- 동일 SERP URL 세션 캐싱: 같은 URL 변환 결과를 한 세션 안에서 재사용합니다.
+- 하드 리밋 임박 경고 메시지: 남은 라운드가 적을 때 우선순위 압박을 명시합니다.
+- MAX_DEPTH 정책 재검토: v1의 `maxDepth=2`는 깊은 네비게이션에 빠듯합니다. v2 설정은 현재 `maxDepth=5`입니다.
 
 ---
 
-## 9. 미분류 / 나중에 검토
+## 구조 / 패키징 후보
 
-- **탐색 결과 캐싱**: 동일 URL 재방문 방지. 현재 `exploredUrls` 배열로 오케스트레이터 레벨에서만 방지. Phase 2 재귀에서 전역 visited set 필요.
-- **검색 소스 라우팅**: 쿼리 의도에 따라 다른 소스 선택 (기술 질문 → Stack Overflow, 국내 뉴스 → Naver, 논문 → arXiv 등)
-- **MCP 서버 포팅**: Phase 1 완료 후 검토. Claude 등 LLM 클라이언트에서 tool로 호출 가능하게.
-- **탐색 세션 저장**: `--out` 옵션으로 변환된 페이지들을 디스크에 저장, 재실행 시 재사용
+- 변환기와 검색 도구 패키지 분리: `llm-page-reader-core`와 `llm-search`로 나누는 방안입니다.
+- 검색 엔진 어댑터 확장: DuckDuckGo, arXiv, Stack Overflow, GitHub 등 특화 소스를 추가할 때의 인터페이스를 정리합니다.
+- 프롬프트 가드 정리: v1/v2 프롬프트에 누적된 가드가 많아졌으므로 평가 하네스 이후 효과가 낮은 규칙을 정리합니다.
+- MCP 서버 노출: v2의 자연어 `research(goal)` 인터페이스는 외부 도구화에 적합합니다.
 
 ---
 
-## 10. 주요 기술 결정 및 이유
+## 완료 이력
 
-| 결정 | 이유 |
-|------|------|
-| Google SERP에 `stealth=true` | Google이 headless Chromium 차단. 실제 Chrome 필요 |
-| SERP 변환 시 `scroll=false` | Google SERP는 초기 로딩에 모든 결과 포함, 스크롤 불필요 |
-| 탐색 페이지 변환 시 `scroll=true` | 콘텐츠 지연 로딩 대응 |
-| LLM 응답 `temperature=0` | 에이전트 판단의 일관성·예측 가능성 확보 |
-| 프롬프트에서 JSON 직접 요청 (tool use 미사용) | MVP 단순성. Phase 2 이후 OpenAI function calling 도입 검토 |
-| SERP 합성 시 URL 인용 금지 | 실제 방문하지 않은 페이지 URL을 출처로 인용하면 신뢰도 문제 |
-| logger가 메모리에 트리 누적 후 finalize 시 일괄 저장 | 에이전트 계층을 JSON 트리로 표현하기 위함. 단점: 크래시 시 로그 유실 |
-| `extractSerpSnippets()` 결과를 루프 외부에서 1회만 계산 | 매 라운드 반복 계산 및 토큰 낭비 방지 |
+- 2026-05-21: v1 거부 경로 구조화 로깅. 모든 거부 경로가 `orchestrator_plan` 이벤트(`action: "rejected"`)로 남도록 정리.
+- 2026-05-21: OpenAI Structured Outputs 마이그레이션. v1 오케스트레이터와 explorer 액션을 JSON Schema strict 모드로 강제.
+- 2026-05-24: v2 Researcher 구조 구현. `SharedBudget`, 단일 재귀 `runResearcher`, `V2Logger`, 통합 CLI 연결.
+- 2026-05-24: v2 섹션 읽기와 후보 ID 안정화. 긴 페이지 섹션 선택, `read_sections`, `[C*]` 후보 ID 스키마 제한, 관련 테스트 추가.

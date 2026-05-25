@@ -1,6 +1,8 @@
-# 에이전트 아키텍처 — 동작·역할·기능 명세
+# v1 에이전트 아키텍처 — 동작·역할·기능 명세
 
-이 문서는 llm-search의 두 에이전트(**오케스트레이터**, **탐색 에이전트**)가 현재 어떤 책임을 지고 어떤 흐름으로 움직이는지를 코드 기준으로 정리한다. CLAUDE.md / AGENTS.md가 빠른 가이드를 제공한다면, 이 문서는 동작 명세에 가깝다.
+이 문서는 llm-search v1의 두 에이전트(**오케스트레이터**, **탐색 에이전트**)가 어떤 책임을 지고 어떤 흐름으로 움직이는지를 코드 기준으로 정리한다. 프로젝트 기본 CLI는 현재 config 기준 v2이지만, v1은 `--v1` 또는 `llm-search-v1`로 계속 실행할 수 있다.
+
+v2 Researcher 구조는 `RESEARCHER_V2.md`와 `CLAUDE.md`를 참고한다. 로드맵과 개선 후보는 `TODO.md`로 통합되었다.
 
 상위 흐름은 `runSearch(options)` → 오케스트레이터 라운드 루프 → 필요 시 `runExplorationAgent(brief)` 호출 → 보고 수집 → 최종 답변 합성.
 
@@ -293,7 +295,7 @@ missingInfo: ...
 |---|---|
 | 오케스트레이터 레벨 `exploredUrls` | 오케스트레이터의 라운드 사이에만 공유 |
 | 한 explorer 트리 내 `visitedUrls` | 부모/자식/형제 explorer 사이 공유 |
-| **다른 explorer 트리 사이** | **공유 안 됨** ← 같은 URL이 트리마다 재변환될 수 있음 (IMPROVEMENTS.md 항목으로 등록) |
+| **다른 explorer 트리 사이** | **공유 안 됨** ← 같은 URL이 트리마다 재변환될 수 있음 (`TODO.md` 개선 후보) |
 
 ---
 
@@ -370,7 +372,7 @@ messages.push({role:"user", content:...})
 
 ## 8. 의도된 비대칭 / 한계
 
-현재 코드에 의도적으로 남아 있는 비대칭이나 한계 (정식 문제는 아니지만 IMPROVEMENTS.md의 후보):
+현재 v1 코드에 의도적으로 남아 있는 비대칭이나 한계:
 
 - **Explorer 트리 간 URL 공유 없음** — 오케스트레이터 입장에서 같은 URL이 다른 트리 안에서 재변환될 수 있음.
 - **Explorer 레벨 병렬 호출 없음** — 자식 호출이 직렬. fan-out 시나리오에서 wall-clock 손실.
@@ -379,4 +381,4 @@ messages.push({role:"user", content:...})
 - **종료 게이트는 프롬프트로만 강제** — 코드 차원의 강제 없음. LLM이 게이트를 잘못 적용하면 시스템은 그대로 진행.
 - **MAX_DEPTH=2의 의미** — Google → landing → list → item처럼 4단계 네비게이션이 필요한 시나리오에 빠듯.
 
-자세한 개선 후보는 `IMPROVEMENTS.md` 참고.
+자세한 개선 후보는 `TODO.md` 참고.

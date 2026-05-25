@@ -63,6 +63,7 @@ node dist/cli.js open P1 L23 --state ./out/example --out ./out/next --page-id P2
 ## llm-search — 에이전트 검색 CLI
 
 LLM이 자율적으로 웹을 탐색하여 질문에 답변합니다.
+프로젝트 루트의 `llm-search.config.json` 기본값은 `v2`입니다.
 
 ```bash
 node dist/search/cli.js --query "질문"
@@ -85,6 +86,11 @@ node dist/search/v2/cli.js --query "질문"
 | `--env <path>` | `.env` | 환경변수 파일 경로 |
 
 버전을 명시하지 않으면 프로젝트 루트의 `llm-search.config.json`에 있는 `version` 값을 사용합니다. 같은 파일에서 v1/v2의 `maxRounds`, `maxSearches`, `maxExplores`, `maxParallel`, `maxDepth`, `maxChildCallsPerAgent` 한도를 조정할 수 있습니다.
+
+현재 구조:
+
+- `v1`: 오케스트레이터가 `search/paginate/explore/explore_parallel/done` 행동 루프를 돌고, URL 탐색은 explorer에게 위임합니다.
+- `v2`: 단일 재귀 Researcher가 `search/paginate/read_sections/delegate/delegate_parallel/done` 행동을 상태별 스키마로 제한하며 수행합니다. 루트는 직접 검색하지 않고 먼저 하위 리서처에게 발견 작업을 위임합니다.
 
 OpenAI API 키가 필요합니다. 프로젝트 루트에 `.env` 파일을 생성하세요.
 
@@ -143,6 +149,7 @@ const result = convertHtml(htmlString, "https://source-url.com", { pageId: "P1" 
 - Page ID: P1
 - Host: www.naver.com
 - Links: 108
+- Elements: 2
 
 ## Navigation
 
