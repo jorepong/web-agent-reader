@@ -329,7 +329,7 @@ describe("Researcher v2 delegation model", () => {
     );
   });
 
-  it("rejects delegate_parallel when filtering leaves only one valid branch", async () => {
+  it("downgrades delegate_parallel when filtering leaves only one valid branch", async () => {
     vi.mocked(convertPage).mockResolvedValue(
       makeResult("https://www.google.com/search?q=x", {
         L1: { id: "L1", text: "Only valid", url: "https://example.com/a", kind: "external", sourcePath: "a" },
@@ -366,27 +366,33 @@ describe("Researcher v2 delegation model", () => {
       depth: 1,
     };
 
-    await runResearcher(brief, client as never, logger as never, new SharedBudget());
+    const budget = new SharedBudget();
+    await runResearcher(brief, client as never, logger as never, budget);
 
     expect(logger.log).toHaveBeenCalledWith(
       "orchestrator_plan",
       "researcher-root-d1",
       expect.objectContaining({
-        action: "rejected",
-        requestedAction: "delegate_parallel",
-        reason: expect.stringContaining("유효한 분기가 최소 2개"),
+        action: "delegate_parallel_downgraded",
+        downgradedTo: "delegate",
+        reason: expect.stringContaining("필터링 후 유효한 분기가 하나"),
+        url: "https://example.com/a",
       }),
     );
+    expect(budget.visitedUrls.has("https://example.com/a")).toBe(true);
+    expect(budget.exploresUsed).toBe(1);
   });
 
-  it("does not mark a single valid branch as visited when delegate_parallel is rejected", async () => {
+  it("downgrades delegate_parallel when visited filtering leaves one branch", async () => {
     vi.mocked(convertPage).mockResolvedValue(
       makeResult("https://www.google.com/search?q=x", {
-        L1: { id: "L1", text: "Only valid", url: "https://example.com/a", kind: "external", sourcePath: "a" },
+        L1: { id: "L1", text: "Already visited", url: "https://example.com/visited", kind: "external", sourcePath: "a" },
+        L2: { id: "L2", text: "Fresh", url: "https://example.com/fresh", kind: "external", sourcePath: "b" },
       }),
     );
 
     const budget = new SharedBudget();
+    budget.visitedUrls.add("https://example.com/visited");
     const client = {
       complete: vi.fn(async (_agentId: string, _messages: unknown[], options: { responseSchema?: { name: string } }) => {
         if (options.responseSchema?.name === "researcher_action_sub_initial") {
@@ -396,8 +402,8 @@ describe("Researcher v2 delegation model", () => {
           return response({
             action: "delegate_parallel",
             branches: [
-              { task: "Read valid page.", linkId: "L1", startUrl: null, rationale: "valid" },
-              { task: "Read invalid page.", linkId: "L404", startUrl: null, rationale: "invalid" },
+              { task: "Read visited page.", linkId: "L1", startUrl: null, rationale: "visited" },
+              { task: "Read fresh page.", linkId: "L2", startUrl: null, rationale: "fresh" },
             ],
             rationale: "try two",
           });
@@ -419,8 +425,18 @@ describe("Researcher v2 delegation model", () => {
 
     await runResearcher(brief, client as never, logger as never, budget);
 
-    expect(budget.visitedUrls.has("https://example.com/a")).toBe(false);
-    expect(budget.exploresUsed).toBe(0);
+    expect(logger.log).toHaveBeenCalledWith(
+      "orchestrator_plan",
+      "researcher-root-d1",
+      expect.objectContaining({
+        action: "delegate_parallel_downgraded",
+        downgradedTo: "delegate",
+        reason: expect.stringContaining("필터링 후 유효한 분기가 하나"),
+        url: "https://example.com/fresh",
+      }),
+    );
+    expect(budget.visitedUrls.has("https://example.com/fresh")).toBe(true);
+    expect(budget.exploresUsed).toBe(1);
   });
 
   it("uses session-wide candidate ids instead of page-local link ids", async () => {
@@ -437,13 +453,13 @@ describe("Researcher v2 delegation model", () => {
     const client = {
       complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string; schema?: unknown }; reasoningEffort?: string }) => {
         if (options.responseSchema?.name === "researcher_action_sub_initial") {
-          expect(options.reasoningEffort).toBe("medium");
+          expect(options.reasoningEffort).toBe("high");
           return response({ action: "search", engine: "google", query: "x", rationale: "start" });
         }
-        if (options.responseSchema?.name === "researcher_action") {
-          expect(options.reasoningEffort).toBe("medium");
+        if (!actionSchema && options.responseSchema?.name !== "researcher_action_sub_initial" && messages.some((message) => message.content.includes("[C1]"))) {
+          expect(options.reasoningEffort).toBe("high");
           actionSchema = options.responseSchema.schema;
-          sawCandidateId = messages.some((message) => message.content.includes("[C1]"));
+          sawCandidateId = true;
           return response({
             action: "delegate",
             task: "Read the first candidate.",
@@ -495,11 +511,13 @@ describe("Researcher v2 delegation model", () => {
     );
 
     let serpPrompt = "";
+    let actionSchema: unknown;
     const client = {
-      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string } }) => {
+      complete: vi.fn(async (_agentId: string, messages: Array<{ content: string }>, options: { responseSchema?: { name: string; schema?: unknown } }) => {
         if (options.responseSchema?.name === "researcher_action_sub_initial") {
           return response({ action: "search", engine: "google", query: "x", rationale: "start" });
         }
+        actionSchema = options.responseSchema?.schema;
         serpPrompt = messages.map((message) => message.content).join("\n");
         return response({
           action: "done",
@@ -523,6 +541,9 @@ describe("Researcher v2 delegation model", () => {
     expect(serpPrompt).toContain("[C1] 이미 방문함");
     expect(serpPrompt).toContain("[C2] 사용 가능");
     expect(serpPrompt).toContain("\"이미 방문함\"으로 표시된 후보는 위임하지 마세요");
+    const targetIdEnums = collectTargetIdEnums(actionSchema);
+    expect(targetIdEnums.some((values) => values.includes("C1"))).toBe(false);
+    expect(targetIdEnums.some((values) => values.includes("C2"))).toBe(true);
   });
 
   it("caps visible targetId enums so structured outputs stay under provider limits", async () => {
@@ -564,7 +585,9 @@ describe("Researcher v2 delegation model", () => {
 
     const targetIdEnums = collectTargetIdEnums(actionSchema);
     expect(targetIdEnums.length).toBeGreaterThan(0);
-    for (const values of targetIdEnums) {
+    const candidateEnums = targetIdEnums.filter((values) => values.some((value) => typeof value === "string"));
+    expect(candidateEnums.length).toBeGreaterThan(0);
+    for (const values of candidateEnums) {
       expect(values.length).toBeLessThanOrEqual(401);
       expect(values).toContain("C400");
       expect(values).not.toContain("C401");

@@ -167,6 +167,14 @@ function mergeVisibleCandidateIds(existing: string[], next: string[]): string[] 
   return merged;
 }
 
+function availableVisibleCandidateIds(currentSurface: CurrentSurface | null, visitedUrls: Set<string>): string[] {
+  if (!currentSurface) return [];
+  return currentSurface.visibleCandidateIds.filter((id) => {
+    const candidate = currentSurface.candidates[id];
+    return Boolean(candidate) && !visitedUrls.has(candidate.url);
+  });
+}
+
 function stripSectionPreviews(outline: string): string {
   return outline.replace(/\s+\|\s+미리보기="[^"]*"/g, "");
 }
@@ -297,7 +305,7 @@ function pickSchema(
     Math.max(0, budget.limits.maxChildCallsPerAgent - childCallCount),
     budget.parallelSlotsRemaining()
   );
-  const candidateIds = currentSurface?.visibleCandidateIds ?? [];
+  const candidateIds = availableVisibleCandidateIds(currentSurface, budget.visitedUrls);
   const canReadSections = currentSurface?.kind === "page" && Boolean(currentSurface.pageSections);
 
   if (brief.parentAgentId === null) {
@@ -325,9 +333,8 @@ function pickSchema(
 }
 
 function actionReasoningEffort(schemaName: string, currentSurface: CurrentSurface | null): "medium" | "high" {
-  if (schemaName === "researcher_action_root_initial_delegate") return "medium";
-  if (schemaName === "researcher_action_sub_initial") return "medium";
-  if (currentSurface?.kind === "serp") return "medium";
+  void schemaName;
+  void currentSurface;
   return "high";
 }
 
@@ -802,6 +809,42 @@ ${selected.markdown}`;
       }
       const rawBranches = Array.isArray(action.branches) ? action.branches : [];
 
+      const runDowngradedBranch = async (branch: DelegateTarget, reason: string, alreadyReserved = false): Promise<boolean> => {
+        if (!alreadyReserved) {
+          const reserve = budget.reserveDelegate(branch.startUrl);
+          if (!reserve.ok) {
+            await reject(round, "delegate_parallel", reserve.reason, { startUrl: branch.startUrl, targetId: branch.targetId, linkId: branch.linkId });
+            return false;
+          }
+        }
+
+        childCallCount++;
+        await logger.log("orchestrator_plan", brief.agentId, {
+          round,
+          action: "delegate_parallel_downgraded",
+          downgradedTo: "delegate",
+          reason,
+          targetId: branch.targetId,
+          linkId: branch.linkId,
+          url: branch.startUrl,
+          task: branch.task,
+          rationale: branch.rationale ?? action.rationale,
+        });
+
+        const childBrief: ResearcherBrief = {
+          agentId: `${brief.agentId}-d${round}-${childCallCount}`,
+          parentAgentId: brief.agentId,
+          goal: branch.task,
+          parentGoal: brief.parentGoal,
+          startUrl: branch.startUrl,
+          depth: brief.depth + 1,
+          runtimeContext: brief.runtimeContext,
+        };
+        const childAnswer = await runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
+        messages.push(buildDelegateResultMessage(branch.label, childAnswer, budget.summary()));
+        return true;
+      };
+
       const validBranches: DelegateTarget[] = [];
       for (const b of rawBranches) {
         const resolved = resolveDelegateTarget(b ?? {}, currentSurface, candidateRegistry);
@@ -812,14 +855,12 @@ ${selected.markdown}`;
         if (validBranches.length >= limit) break;
       }
 
-      if (validBranches.length < 2) {
-        await reject(
-          round,
-          "delegate_parallel",
-          validBranches.length === 0
-            ? `유효한 분기가 없습니다. targetId/startUrl이 잘못되었거나 task가 없거나 모두 이미 방문했습니다.`
-            : `delegate_parallel은 필터링 후 유효한 분기가 최소 2개 필요합니다. 남은 분기가 하나라면 delegate를 사용하세요.`,
-        );
+      if (validBranches.length === 0) {
+        await reject(round, "delegate_parallel", `유효한 분기가 없습니다. targetId/startUrl이 잘못되었거나 task가 없거나 모두 이미 방문했습니다.`);
+        continue;
+      }
+      if (validBranches.length === 1) {
+        await runDowngradedBranch(validBranches[0]!, "필터링 후 유효한 분기가 하나만 남았습니다.");
         continue;
       }
 
@@ -830,14 +871,12 @@ ${selected.markdown}`;
         reservedBranches.push(branch);
       }
 
-      if (reservedBranches.length < 2) {
-        await reject(
-          round,
-          "delegate_parallel",
-          reservedBranches.length === 0
-            ? `예약 후 남은 유효 분기가 없습니다.`
-            : `delegate_parallel은 예약된 분기가 최소 2개 필요합니다. 남은 분기가 하나라면 delegate를 사용하세요.`,
-        );
+      if (reservedBranches.length === 0) {
+        await reject(round, "delegate_parallel", `예약 후 남은 유효 분기가 없습니다.`);
+        continue;
+      }
+      if (reservedBranches.length === 1) {
+        await runDowngradedBranch(reservedBranches[0]!, "예약 후 유효한 분기가 하나만 남았습니다.", true);
         continue;
       }
 
