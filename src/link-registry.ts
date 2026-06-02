@@ -52,7 +52,7 @@ export class LinkRegistryBuilder {
 }
 
 export function compact(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
+  return value.replace(/\s+/g, " ").replace(/(\d)\s+(?=[가-힣])/g, "$1").replace(/·\s+(?=\d|[가-힣])/g, "·").trim();
 }
 
 function classifyUrl(url: string, sourceUrl: string): LinkEntry["kind"] {
