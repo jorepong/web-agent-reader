@@ -15,12 +15,26 @@ export interface ConvertOptions {
   stealth?: boolean;
 }
 
+// 클릭으로만 목적지가 정해지는 비-앵커 작동 요소(예: SPA 카드)를 다시 찾기 위한 locator.
+// id는 렌더마다 바뀌므로, 재현 가능한 신호(보이는 텍스트 + 반복 그룹 내 순번)만 저장한다.
+export interface ActivateLocator {
+  /** 요소의 보이는 라벨. 렌더가 바뀌어도 동일하게 매칭된다. */
+  text: string;
+  /** 같은 구조로 반복되는 형제 중 0부터 센 순번. 텍스트가 유일하지 않을 때의 보조 키. */
+  index: number;
+}
+
 export interface LinkEntry {
   id: string;
   text: string;
+  /** href 링크의 절대 URL. activate 링크는 클릭 전까지 URL이 없어 빈 문자열이다. */
   url: string;
-  kind: "internal" | "external" | "anchor" | "asset" | "unknown";
+  kind: "internal" | "external" | "anchor" | "asset" | "action" | "unknown";
   sourcePath: string;
+  /** href: 정적 URL로 즉시 해소(기본). activate: 클릭해야 목적지가 정해지는 작동 요소. */
+  resolution?: "href" | "activate";
+  /** resolution === "activate"일 때 그 요소를 다시 찾기 위한 locator. */
+  locator?: ActivateLocator;
 }
 
 export interface LinkRegistry {
