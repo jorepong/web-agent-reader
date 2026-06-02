@@ -1,13 +1,65 @@
-import { chromium, type Page } from "playwright";
+import { chromium, type Browser, type Locator, type Page } from "playwright";
 import { convertHtml } from "./dom-normalizer.js";
 import { readLinkRegistry } from "./io.js";
-import type { ConvertOptions, ConvertResult, LinkEntry, RenderMetadata, RenderSnapshot } from "./types.js";
+import type { ActivateLocator, ConvertOptions, ConvertResult, LinkEntry, RenderMetadata, RenderSnapshot } from "./types.js";
 
 export { convertHtml } from "./dom-normalizer.js";
 export { readLinkRegistry, writeResult } from "./io.js";
 export type * from "./types.js";
 
 export async function convertPage(url: string, options: ConvertOptions = {}): Promise<ConvertResult> {
+  const { browser, page } = await launchPage(options);
+  try {
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: options.timeoutMs ?? 30_000,
+    });
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+    return await finalizePage(page, options);
+  } finally {
+    await browser.close();
+  }
+}
+
+// 비-앵커 작동 요소(activate 링크)를 해소한다.
+// pageUrl을 새로 열고, locator로 그 요소를 찾아 클릭한 뒤 도착한 페이지를 변환한다.
+// 부모의 살아있는 페이지를 건드리지 않으므로 병렬 해소에도 안전하다.
+export async function activateLink(pageUrl: string, locator: ActivateLocator, options: ConvertOptions = {}): Promise<ConvertResult> {
+  const { browser, page } = await launchPage(options);
+  try {
+    await page.goto(pageUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: options.timeoutMs ?? 30_000,
+    });
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+    // 지연 로딩되는 카드까지 나타나도록 한 번 안정화한 뒤 대상을 찾는다.
+    await stabilizeByScrolling(page, options);
+
+    const target = await locateActivateTarget(page, locator);
+    if (!target) {
+      throw new Error(`activate 대상을 찾지 못했습니다 (locator.text="${locator.text}")`);
+    }
+
+    const before = page.url();
+    const popupPromise = page.context().waitForEvent("page", { timeout: 4_000 }).catch(() => null);
+    await target.scrollIntoViewIfNeeded().catch(() => undefined);
+    await target.click({ timeout: 10_000 });
+
+    // 새 탭으로 열렸으면 그 탭을, 아니면 같은 페이지의 SPA 라우팅을 기다린다.
+    const popup = await popupPromise;
+    const active = popup ?? page;
+    if (!popup) {
+      await page.waitForFunction((prev) => location.href !== prev, before, { timeout: 8_000 }).catch(() => undefined);
+    }
+    await active.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+
+    return await finalizePage(active, options);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function launchPage(options: ConvertOptions): Promise<{ browser: Browser; page: Page }> {
   const stealth = options.stealth ?? false;
   const browser = await chromium.launch({
     headless: true,
@@ -16,33 +68,44 @@ export async function convertPage(url: string, options: ConvertOptions = {}): Pr
       args: ["--disable-blink-features=AutomationControlled"],
     }),
   });
-  try {
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      locale: "ko-KR",
-      ...(stealth && {
-        extraHTTPHeaders: { "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" },
-      }),
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    locale: "ko-KR",
+    ...(stealth && {
+      extraHTTPHeaders: { "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" },
+    }),
+  });
+  if (stealth) {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     });
-    if (stealth) {
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-      });
-    }
-    const page = await context.newPage();
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: options.timeoutMs ?? 30_000,
-    });
-    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
-    const render = await stabilizeByScrolling(page, options);
-    await removeNonRenderedElements(page);
-    const html = await page.content();
-    return convertHtml(html, page.url(), { ...options, render });
-  } finally {
-    await browser.close();
   }
+  const page = await context.newPage();
+  return { browser, page };
+}
+
+async function finalizePage(page: Page, options: ConvertOptions): Promise<ConvertResult> {
+  const render = await stabilizeByScrolling(page, options);
+  await removeNonRenderedElements(page);
+  const html = await page.content();
+  return convertHtml(html, page.url(), { ...options, render });
+}
+
+// 보이는 텍스트로 activate 대상을 찾는다. id가 렌더마다 바뀌어도 내용 기반이라 안정적이다.
+async function locateActivateTarget(page: Page, locator: ActivateLocator): Promise<Locator | null> {
+  const tryText = async (text: string): Promise<Locator | null> => {
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+    const matches = page.getByText(trimmed, { exact: false });
+    const count = await matches.count().catch(() => 0);
+    if (count === 0) return null;
+    if (count === 1) return matches.first();
+    return matches.nth(Math.min(Math.max(locator.index, 0), count - 1));
+  };
+
+  // 전체 라벨 → 실패 시 앞부분 일부(분할 렌더로 전체 매칭이 안 될 때)로 후퇴.
+  return (await tryText(locator.text)) ?? (await tryText(locator.text.slice(0, 24)));
 }
 
 async function removeNonRenderedElements(page: Page): Promise<void> {
