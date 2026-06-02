@@ -236,7 +236,7 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
 
   const blocks = Array.from(element.children).flatMap((child) => elementToBlocks(child, registry, elementRegistry, options, role));
   if (blocks.length) return blocks;
-  const text = compact(element.textContent ?? "");
+  const text = inlineText(element, registry, cssPath(element));
   return text.length > 30 && !isLayoutOnly(role, tag) ? [{ type: "paragraph", text }] : [];
 }
 
@@ -306,14 +306,17 @@ function isLayoutOnly(role: RegionRole, tag: string): boolean {
 function isParagraphLikeContainer(element: Element): boolean {
   const tag = element.tagName.toLowerCase();
   if (!["div", "span"].includes(tag)) return false;
+  if (element.querySelector("button,input,select,textarea")) return false;
+  if (element.querySelector("h1,h2,h3,h4,h5,h6,table,ul,ol,li,section,article,main,nav,aside,footer,form")) return false;
+
   const directText = Array.from(element.childNodes)
     .filter((node) => node.nodeType === 3)
     .map((node) => node.textContent ?? "")
     .join(" ");
-  if (compact(directText).length < 20) return false;
-  return !Array.from(element.children).some((child) =>
-    /^(h[1-6]|table|ul|ol|li|section|article|main|nav|aside|footer|form)$/i.test(child.tagName),
-  );
+  if (compact(directText).length >= 20) return true;
+
+  const descendantText = compact(element.textContent ?? "");
+  return element.children.length > 0 && descendantText.length >= 20 && descendantText.length <= 180;
 }
 
 function listBlock(element: Element, registry: LinkRegistryBuilder): ContentBlock[] {

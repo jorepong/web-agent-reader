@@ -135,4 +135,47 @@ describe("convertHtml", () => {
     expect(result.links.links.L1?.url).toBe("https://example.com/settings");
     expect(result.links.links.L2?.url).toBe("https://example.com/profile");
   });
+
+  it("keeps compact card labels and separates nested text runs", () => {
+    const result = convertHtml(
+      `<!doctype html>
+      <html>
+        <body>
+          <main>
+            <div>
+              <div>
+                <span>6</span><span>개 계열사·</span><span>20</span><span>개의 포지션이 열려 있어요</span>
+              </div>
+              <div>
+                <div>
+                  <div><span>토스</span></div>
+                  <span>간편하면서도 안전한, 금융을 넘어선 서비스를 만들어요.</span>
+                </div>
+                <div>
+                  <div>3개 포지션</div>
+                  <div>Product</div>
+                  <div>Platform</div>
+                  <div>Productivity</div>
+                </div>
+              </div>
+              <div>
+                <div>토스 서버의 조직 구조를 알려드려요</div>
+                <div>토스의 Server Developer는 Product, Platform, Productivity 세 개의 Chapter로 나뉘어 일합니다.</div>
+              </div>
+              <div style="display:none">6개 계열사·20개의 포지션이 열려 있어요</div>
+            </div>
+          </main>
+        </body>
+      </html>`,
+      "https://toss.im/career/job-detail?job_id=4071141003",
+      { pageId: "P1" },
+    );
+
+    expect(result.markdown).toContain("6개 계열사·20개의 포지션이 열려 있어요");
+    expect(result.markdown.match(/6개 계열사/g) ?? []).toHaveLength(1);
+    expect(result.markdown).toContain("토스 간편하면서도 안전한, 금융을 넘어선 서비스를 만들어요.");
+    expect(result.markdown).toContain("3개 포지션 Product Platform Productivity");
+    expect(result.markdown).not.toContain("3개 포지션ProductPlatformProductivity");
+    expect(result.markdown).not.toContain("6 개 계열사· 20 개의 포지션이 열려 있어요");
+  });
 });
