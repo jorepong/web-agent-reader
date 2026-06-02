@@ -234,10 +234,104 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
     return text ? [{ type: "paragraph", text }] : [];
   }
 
+  if (role === "main" || role === "aside") {
+    const cardGroup = detectCardGroup(element);
+    if (cardGroup) return renderCardGroup(element, cardGroup, registry, elementRegistry, options, role);
+  }
+
   const blocks = Array.from(element.children).flatMap((child) => elementToBlocks(child, registry, elementRegistry, options, role));
   if (blocks.length) return blocks;
   const text = inlineText(element, registry, cssPath(element));
   return text.length > 30 && !isLayoutOnly(role, tag) ? [{ type: "paragraph", text }] : [];
+}
+
+// SPA에서 같은 컴포넌트로 반복 렌더된 카드 묶음을 감지한다.
+// href가 없어 링크로 안 잡히지만 클릭하면 이동하는 목록 항목(채용/상품/검색결과 카드 등)이 대상.
+// 탐지가 틀려도 실패 모드는 "후보 누락"이라 안전하므로, 신호가 또렷할 때만 보수적으로 발동한다.
+function detectCardGroup(element: Element): Element[] | null {
+  const tag = element.tagName.toLowerCase();
+  if (/^(ul|ol|table|a|button|input|select|textarea)$/.test(tag)) return null;
+  // 보조 영역(필터·위젯·내비)은 주 콘텐츠 목록이 아니다. 구조가 카드와 닮아도 제외한다.
+  if (element.closest("aside, nav, header, footer")) return null;
+
+  const children = Array.from(element.children).filter((child) => child.nodeType === 1) as Element[];
+  if (children.length < 3) return null;
+
+  const groups = new Map<string, Element[]>();
+  for (const child of children) {
+    const sig = structuralSignature(child);
+    const bucket = groups.get(sig);
+    if (bucket) bucket.push(child);
+    else groups.set(sig, [child]);
+  }
+
+  let group: Element[] | null = null;
+  for (const bucket of groups.values()) {
+    if (bucket.length >= 3 && bucket.length >= children.length * 0.6) group = bucket;
+  }
+  if (!group) return null;
+
+  // 카드 자신이 네이티브 컨트롤이면(예: 필터 버튼 묶음) 제외한다.
+  if (group.some((card) => /^(a|button|input|select|textarea)$/i.test(card.tagName))) return null;
+  // 카드가 자체 앵커를 품으면 기존 href 경로가 이미 [L#]을 부여하므로 중복 활성화를 피한다.
+  // (북마크 버튼 같은 내부 컨트롤은 허용 — 카드 자체는 여전히 클릭하면 이동하는 작동 요소다.)
+  if (group.some((card) => card.querySelector("a[href]"))) return null;
+  if (group.some((card) => compact(card.textContent ?? "").length < 8)) return null;
+
+  return group;
+}
+
+// 반복 카드는 같은 컴포넌트라 class 속성이 동일하다. 토큰 순서 차이만 정규화해 비교한다.
+function structuralSignature(element: Element): string {
+  const classes = (element.getAttribute("class") ?? "").split(/\s+/).filter(Boolean).sort().join(" ");
+  return `${element.tagName.toLowerCase()}::${classes}`;
+}
+
+function renderCardGroup(
+  parent: Element,
+  group: Element[],
+  registry: LinkRegistryBuilder,
+  elementRegistry: ElementRegistryBuilder,
+  options: Required<Pick<ConvertOptions, "maxTableRows" | "maxTableColumns" | "maxCellLength">>,
+  role: RegionRole,
+): ContentBlock[] {
+  const groupSet = new Set(group);
+  let cardIndex = 0;
+  return Array.from(parent.children).flatMap((node) => {
+    if (node.nodeType !== 1) return [];
+    const child = node as Element;
+    if (!groupSet.has(child)) return elementToBlocks(child, registry, elementRegistry, options, role);
+
+    const index = cardIndex++;
+    const blocks = elementToBlocks(child, registry, elementRegistry, options, role);
+    const label = cardLabel(blocks, child);
+    if (!label) return blocks;
+    const linkId = registry.registerActivate(label, { text: label, index }, cssPath(child));
+    return linkId ? attachActivateMarker(blocks, linkId) : blocks;
+  });
+}
+
+function cardLabel(blocks: ContentBlock[], element: Element): string {
+  for (const block of blocks) if (block.type === "heading") return stripInlineMarkers(block.text).slice(0, 100);
+  for (const block of blocks) if (block.type === "paragraph") return stripInlineMarkers(block.text).slice(0, 100);
+  return stripInlineMarkers(compact(element.textContent ?? "")).slice(0, 100);
+}
+
+function stripInlineMarkers(text: string): string {
+  return compact(text.replace(/\[L\d+\]/g, "").replace(/\[(image|button|input)[^\]]*\]/gi, ""));
+}
+
+// 카드의 첫 제목(없으면 첫 문단)에 activate 마커를 붙인다. 둘 다 없으면 마커 단독 문단을 앞에 둔다.
+function attachActivateMarker(blocks: ContentBlock[], linkId: string): ContentBlock[] {
+  const marker = `[${linkId}]`;
+  let idx = blocks.findIndex((block) => block.type === "heading");
+  if (idx < 0) idx = blocks.findIndex((block) => block.type === "paragraph");
+  if (idx < 0) return [{ type: "paragraph", text: marker }, ...blocks];
+  return blocks.map((block, i) => {
+    if (i !== idx) return block;
+    if (block.type === "heading" || block.type === "paragraph") return { ...block, text: `${block.text} ${marker}` };
+    return block;
+  });
 }
 
 function isIgnorable(element: Element): boolean {

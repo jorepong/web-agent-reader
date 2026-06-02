@@ -178,4 +178,63 @@ describe("convertHtml", () => {
     expect(result.markdown).not.toContain("3개 포지션ProductPlatformProductivity");
     expect(result.markdown).not.toContain("6 개 계열사· 20 개의 포지션이 열려 있어요");
   });
+
+  it("registers non-anchor repeated cards as activate links", () => {
+    const card = (corp: string, title: string) =>
+      `<div class="card">
+         <h4>[${corp}] ${title}</h4>
+         <div><span>Tech</span><span>경력</span></div>
+       </div>`;
+    const result = convertHtml(
+      `<!doctype html>
+      <html>
+        <body>
+          <main>
+            <section class="list">
+              ${card("NHN COMMERCE", "커머스 솔루션 QA 담당자")}
+              ${card("NHN", "AI 전환 백엔드 개발")}
+              ${card("NHN Cloud", "데이터 보안 기술 개발")}
+              ${card("NHN PAYCO", "Java 서버 개발")}
+            </section>
+          </main>
+        </body>
+      </html>`,
+      "https://careers.nhn.com/recruits",
+      { pageId: "P1" },
+    );
+
+    // 카드 4개가 모두 activate 링크로 등록되고 [L#] 마커가 제목에 붙는다.
+    const activate = Object.values(result.links.links).filter((l) => l.resolution === "activate");
+    expect(activate).toHaveLength(4);
+    expect(result.markdown).toMatch(/\[NHN COMMERCE\] 커머스 솔루션 QA 담당자 \[L\d+\]/);
+
+    // locator는 보이는 텍스트 + 0부터 센 순번을 담는다.
+    const first = activate.find((l) => l.text.includes("커머스 솔루션 QA"));
+    expect(first?.locator?.index).toBe(0);
+    expect(first?.locator?.text).toContain("커머스 솔루션 QA 담당자");
+    expect(first?.url).toBe("");
+    expect(first?.kind).toBe("action");
+  });
+
+  it("does not treat native control groups as activate links", () => {
+    const result = convertHtml(
+      `<!doctype html>
+      <html>
+        <body>
+          <main>
+            <div class="filters">
+              <button>ALL</button>
+              <button>Tech</button>
+              <button>Business</button>
+              <button>Design</button>
+            </div>
+          </main>
+        </body>
+      </html>`,
+      "https://careers.nhn.com/recruits",
+      { pageId: "P1" },
+    );
+
+    expect(Object.values(result.links.links).filter((l) => l.resolution === "activate")).toHaveLength(0);
+  });
 });
