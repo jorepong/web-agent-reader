@@ -195,6 +195,19 @@ export async function resolveLink(stateDir: string, pageId: string, linkId: stri
 }
 
 export async function openLink(stateDir: string, pageId: string, linkId: string, options: ConvertOptions = {}): Promise<ConvertResult> {
-  const link = await resolveLink(stateDir, pageId, linkId);
+  const registry = await readLinkRegistry(stateDir);
+  if (registry.pageId !== pageId) {
+    throw new Error(`Page ID mismatch: state has ${registry.pageId}, requested ${pageId}`);
+  }
+  const link = registry.links[linkId];
+  if (!link) {
+    throw new Error(`Link not found: ${linkId}`);
+  }
+  // activate 링크는 URL이 없으므로, 카드가 있던 표면 페이지를 다시 열어 locator로 클릭해 해소한다.
+  if (link.resolution === "activate") {
+    if (!link.locator) throw new Error(`Activate link ${linkId} has no locator.`);
+    return activateLink(registry.sourceUrl, link.locator, options);
+  }
+  if (!link.url) throw new Error(`Link ${linkId} has no URL to open.`);
   return convertPage(link.url, options);
 }
