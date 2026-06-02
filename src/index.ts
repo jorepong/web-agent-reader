@@ -37,11 +37,23 @@ export async function convertPage(url: string, options: ConvertOptions = {}): Pr
     });
     await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
     const render = await stabilizeByScrolling(page, options);
+    await removeNonRenderedElements(page);
     const html = await page.content();
     return convertHtml(html, page.url(), { ...options, render });
   } finally {
     await browser.close();
   }
+}
+
+async function removeNonRenderedElements(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    for (const element of Array.from(document.body?.querySelectorAll("*") ?? [])) {
+      const style = window.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+        element.remove();
+      }
+    }
+  });
 }
 
 async function stabilizeByScrolling(page: Page, options: ConvertOptions): Promise<RenderMetadata> {
