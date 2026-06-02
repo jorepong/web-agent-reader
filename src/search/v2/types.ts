@@ -2,7 +2,7 @@
 // v1과 의도적으로 분리되어 있다. v1의 SearchOptions/MissionBrief/ExplorationReport와는
 // 독립적으로 진화한다.
 
-import type { ConvertResult } from "../../types.js";
+import type { ActivateLocator, ConvertResult } from "../../types.js";
 import type { SearchEngine } from "../search-engines.js";
 import type { SectionedMarkdown } from "./sections.js";
 
@@ -41,6 +41,15 @@ export interface ResearcherBrief {
   startUrl?: string;              // 있으면 시작점 페이지, 없으면 root
   depth: number;                  // root=0
   runtimeContext?: RuntimeContext; // 실행 시점의 동적 컨텍스트. 시스템 프롬프트가 아닌 user 메시지에만 삽입.
+  // activate 후보로 위임된 경우: 시작 페이지를 convertPage(startUrl) 대신
+  // activateLink(pageUrl, locator)로 — 즉 부모 표면에서 그 카드를 클릭해 — 해소한다.
+  activate?: ActivateTarget;
+}
+
+// 비-앵커 작동 요소(카드)로의 위임. URL이 없어 클릭으로 목적지를 정해야 한다.
+export interface ActivateTarget {
+  pageUrl: string;          // 카드가 있던 표면 페이지 URL
+  locator: ActivateLocator; // 그 페이지에서 카드를 다시 찾을 내용 기반 locator
 }
 
 // 리서처가 반환하는 자연어 답변.
@@ -78,8 +87,10 @@ export interface CandidateLink {
   id: string;
   originalLinkId: string;
   text: string;
-  url: string;
+  url: string;             // activate 후보는 클릭 전까지 URL이 없어 합성 키가 들어간다.
   sourcePath: string;
   surfaceUrl: string;
   surfaceKind: SurfaceKind;
+  resolution?: "href" | "activate";
+  locator?: ActivateLocator;
 }

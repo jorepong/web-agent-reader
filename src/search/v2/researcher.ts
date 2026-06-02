@@ -19,7 +19,7 @@
 //
 // v1에서 그대로 import해 쓰는 인프라:
 //   convertPage, DebugLogger, OpenAIClient, parseJsonResponse, buildSerpUrl, isSupportedEngine
-import { convertPage } from "../../index.js";
+import { activateLink, convertPage } from "../../index.js";
 import type { ConvertResult } from "../../types.js";
 import { parseJsonResponse } from "../json-utils.js";
 import type { OpenAIClient } from "../openai-client.js";
@@ -55,7 +55,7 @@ import {
   formatSectionOutline,
   selectSectionMarkdown,
 } from "./sections.js";
-import type { CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, ResearchOptions, RuntimeContext, SurfaceKind } from "./types.js";
+import type { ActivateTarget, CandidateLink, CurrentSurface, LLMMessage, ResearcherBrief, ResearchOptions, RuntimeContext, SurfaceKind } from "./types.js";
 
 const SECTION_SELECTION_THRESHOLD_CHARS = 40_000;
 const MAX_SELECTED_PAGE_CHARS = 60_000;
@@ -86,14 +86,17 @@ class CandidateRegistry {
     const candidates: Record<string, CandidateLink> = {};
     for (const entry of Object.values(result.links.links)) {
       const id = `C${this.nextId++}`;
+      const isActivate = entry.resolution === "activate" && Boolean(entry.locator);
       const candidate: CandidateLink = {
         id,
         originalLinkId: entry.id,
         text: entry.text,
-        url: entry.url,
+        // activate 후보는 실 URL이 없으므로 예산 중복방지가 동작하도록 합성 키를 넣는다.
+        url: isActivate ? `activate:${surfaceUrl}#${entry.locator!.text}` : entry.url,
         sourcePath: entry.sourcePath,
         surfaceUrl,
         surfaceKind,
+        ...(isActivate ? { resolution: "activate" as const, locator: entry.locator } : {}),
       };
       candidates[id] = candidate;
       this.byId[id] = candidate;
@@ -380,6 +383,8 @@ interface DelegateTarget {
   targetId?: string;
   linkId?: string;
   rationale?: string;
+  // 비-앵커 카드로의 위임이면, 자식은 startUrl을 convertPage가 아니라 클릭으로 해소한다.
+  activate?: ActivateTarget;
 }
 
 function resolveDelegateTarget(
@@ -408,15 +413,23 @@ function resolveDelegateTarget(
       const stale = known ? ` 이 ID는 이전 ${known.surfaceKind} 표면에 있었으므로 지금은 오래된 후보입니다.` : "";
       return { ok: false, reason: `현재 SERP 또는 페이지에서 targetId ${targetId}를 찾을 수 없습니다.${stale}` };
     }
+    const activate: ActivateTarget | undefined =
+      candidate.resolution === "activate" && candidate.locator
+        ? { pageUrl: candidate.surfaceUrl, locator: candidate.locator }
+        : undefined;
+    const label = activate
+      ? `후보 ${candidate.id}: ${candidate.text} (클릭으로 해소: ${candidate.surfaceUrl})`
+      : `후보 ${candidate.id}: ${candidate.text} (${candidate.url})`;
     return {
       ok: true,
       target: {
         task: action.task.trim(),
         startUrl: candidate.url,
-        label: `후보 ${candidate.id}: ${candidate.text} (${candidate.url})`,
+        label,
         targetId: candidate.id,
         linkId: candidate.originalLinkId,
         rationale: action.rationale,
+        activate,
       },
     };
   }
@@ -484,18 +497,23 @@ export async function runResearcher(
     // 자식 리서처: 시작 페이지가 주어짐.
     // budget의 visitedUrls는 부모가 reserveExplore에서 이미 등록했으므로 여기선 안 등록.
     try {
-      const result = await convertPage(brief.startUrl, { scroll: true, stealth: true, pageId: brief.agentId });
+      // 일반 위임은 startUrl을 convertPage로, activate 위임은 부모 표면에서 카드를 클릭해 해소한다.
+      const result = brief.activate
+        ? await activateLink(brief.activate.pageUrl, brief.activate.locator, { scroll: true, stealth: true, pageId: brief.agentId })
+        : await convertPage(brief.startUrl, { scroll: true, stealth: true, pageId: brief.agentId });
+      const resolvedUrl = result.page.sourceUrl;
       await logger.log("page_markdown", brief.agentId, {
-        url: brief.startUrl,
+        url: resolvedUrl,
+        activatedFrom: brief.activate ? brief.activate.pageUrl : undefined,
         markdown: result.markdown,
         pageId: result.page.pageId,
       });
-      const candidates = candidateRegistry.registerSurface(result, "page", brief.startUrl);
+      const candidates = candidateRegistry.registerSurface(result, "page", resolvedUrl);
       const prepared = await preparePageReadMarkdown(brief, result, candidates, client, logger, budget);
       const limited = limitVisibleCandidates(prepared.markdown);
       if (limited.omittedCount > 0) {
         await logger.log("page_section_selection", brief.agentId, {
-          url: brief.startUrl,
+          url: resolvedUrl,
           schemaCandidateLimit: MAX_SCHEMA_CANDIDATE_IDS,
           omittedCandidateIds: limited.omittedCount,
         });
@@ -504,7 +522,7 @@ export async function runResearcher(
       messages = buildChildInitialMessages(
         brief.goal,
         brief.parentGoal,
-        brief.startUrl,
+        resolvedUrl,
         limited.markdown,
         budget.limits.maxParallel,
         candidateStatus,
@@ -518,7 +536,7 @@ export async function runResearcher(
         engine: "google", // placeholder; paginate는 의미 없으나 schema가 막아주진 않음 — 호출부 검사
         query: "",
         page: 1,
-        url: brief.startUrl,
+        url: resolvedUrl,
         result,
         candidates,
         visibleCandidateIds: limited.visibleIds,
@@ -787,6 +805,7 @@ ${selected.markdown}`;
         startUrl: resolved.target.startUrl,
         depth: brief.depth + 1,
         runtimeContext: brief.runtimeContext,
+        activate: resolved.target.activate,
       };
 
       // 재귀 호출 — 자기 자신을 호출. 자식의 답변은 자연어 문자열.
@@ -839,6 +858,7 @@ ${selected.markdown}`;
           startUrl: branch.startUrl,
           depth: brief.depth + 1,
           runtimeContext: brief.runtimeContext,
+          activate: branch.activate,
         };
         const childAnswer = await runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
         messages.push(buildDelegateResultMessage(branch.label, childAnswer, budget.summary()));
@@ -898,6 +918,7 @@ ${selected.markdown}`;
             startUrl: vb.startUrl,
             depth: brief.depth + 1,
             runtimeContext: brief.runtimeContext,
+            activate: vb.activate,
           };
           return runChildResearcherSafely(childBrief, client, logger, budget, candidateRegistry);
         })
