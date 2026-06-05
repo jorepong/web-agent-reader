@@ -194,7 +194,13 @@ function formatCandidateStatus(
     .slice(0, maxRows)
     .map((candidate) => {
       const status = visitedUrls.has(candidate.url) ? "이미 방문함" : "사용 가능";
-      return `[${candidate.id}] ${status} — ${candidate.text} — ${candidate.url}`;
+      // activate 후보의 url은 내부 중복방지용 합성 키(activate:...)다. 모델에 노출하면 이를
+      // startUrl로 되복사할 수 있으므로, 표시는 표면 URL + 클릭형 안내로 대체한다.
+      const displayUrl =
+        candidate.resolution === "activate"
+          ? `${candidate.surfaceUrl} (클릭형 후보 — startUrl이 아니라 targetId로 위임)`
+          : candidate.url;
+      return `[${candidate.id}] ${status} — ${candidate.text} — ${displayUrl}`;
     });
   if (rows.length === 0) return "";
   if (candidateIds.length > maxRows) rows.push(`... 표시 후보 ${candidateIds.length - maxRows}개는 상태 목록에서 생략됨`);
@@ -451,20 +457,28 @@ function resolveDelegateTarget(
   }
 
   if (rawStartUrl) {
+    let parsed: URL;
     try {
-      const normalized = new URL(rawStartUrl).toString();
-      return {
-        ok: true,
-        target: {
-          task: action.task.trim(),
-          startUrl: normalized,
-          label: `starting URL: ${normalized}`,
-          rationale: action.rationale,
-        },
-      };
+      parsed = new URL(rawStartUrl);
     } catch {
       return { ok: false, reason: `delegate.startUrl은 유효한 절대 URL이어야 합니다.` };
     }
+    // http/https만 허용한다. new URL은 "activate:..." 같은 임의 스킴도 파싱하므로,
+    // 내부 합성 키가 startUrl로 흘러 들어와 convertPage가 실패하는 것을 여기서 막는다.
+    // 클릭형(activate) 후보는 startUrl이 아니라 targetId로 위임해야 한다.
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { ok: false, reason: `delegate.startUrl은 http/https URL이어야 합니다. 클릭형 후보는 startUrl이 아니라 targetId로 위임하세요.` };
+    }
+    const normalized = parsed.toString();
+    return {
+      ok: true,
+      target: {
+        task: action.task.trim(),
+        startUrl: normalized,
+        label: `starting URL: ${normalized}`,
+        rationale: action.rationale,
+      },
+    };
   }
 
   return {
