@@ -237,4 +237,70 @@ describe("convertHtml", () => {
 
     expect(Object.values(result.links.links).filter((l) => l.resolution === "activate")).toHaveLength(0);
   });
+
+  it("captures bare text nodes that sit directly under a container (no <p> wrappers)", () => {
+    // 일부 언론 CMS는 본문을 <p> 없이 텍스트+<br>로 쓰고, 깨진 마크업이 본문을 컨테이너
+    // 직속으로 밀어낸다. 자식 요소만 재귀하면 본문이 통째로 누락된다.
+    const result = convertHtml(
+      `<!doctype html><html><body><main>
+        <article>
+          <div class="summury"><h2>소제목</h2></div>
+          [서울=뉴시스] 김경택 기자 = 삼성전자와 SK하이닉스가 큰 폭의 급락세를 맞았다.<br /><br />
+          5일 한국거래소에 따르면 삼성전자는 2만2500원(6.40%) 내린 32만9000원에 거래를 마쳤다.
+          <a href="/related">관련 기사</a>
+        </article>
+      </main></body></html>`,
+      "https://www.newsis.com/view/X",
+      { pageId: "P1" },
+    );
+    expect(result.markdown).toContain("삼성전자와 SK하이닉스가 큰 폭의 급락세");
+    expect(result.markdown).toContain("6.40%");
+    // 소제목과 링크 같은 자식 블록도 그대로 유지된다.
+    expect(result.markdown).toContain("소제목");
+    expect(result.markdown).toMatch(/관련 기사 \[L\d+\]/);
+  });
+
+  it("preserves sign/direction from accessible text via [a11y: ...] marker", () => {
+    const result = convertHtml(
+      `<!doctype html><html><body><main>
+        <p><span>478.82</span> <span class="icon down is_minus" aria-label="-5.54% 감소">5.54%</span></p>
+      </main></body></html>`,
+      "https://example.com",
+      { pageId: "P1" },
+    );
+    // 보이는 텍스트(5.54%)와 접근성 텍스트(-5.54% 감소)가 다르면 표식으로 부호·방향을 보존한다.
+    expect(result.markdown).toContain("[a11y: -5.54% 감소]");
+  });
+
+  it("does not add an a11y marker when accessible text matches visible text", () => {
+    const result = convertHtml(
+      `<!doctype html><html><body><main>
+        <p>설명이 충분히 길어 main으로 분류되는 문단. <span aria-label="확인">확인</span></p>
+      </main></body></html>`,
+      "https://example.com",
+      { pageId: "P1" },
+    );
+    expect(result.markdown).not.toContain("[a11y:");
+  });
+
+  it("surfaces role=text aria value nodes as a deduplicated Key Values region", () => {
+    const ticker = `<li><div class="item" role="text"><b>코스피</b><p aria-label="8,160.59원, -5.54% 감소"><span aria-hidden="true">8,160.59</span><span aria-hidden="true">-5.54%</span></p></div></li>`;
+    const result = convertHtml(
+      `<!doctype html><html><body>
+        <header><ul class="ticker">${ticker}${ticker}${ticker}</ul></header>
+        <main><article><h1>지수</h1><p>지수 상세 표 본문이 충분히 길어 main 영역으로 분류되도록 채운 문단입니다. 부호가 클래스로만 표현된 표는 별도로 존재합니다.</p></article></main>
+      </body></html>`,
+      "https://stock.example.com",
+      { pageId: "P1" },
+    );
+    const md = result.markdown;
+    const start = md.indexOf("## Key Values");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const rest = md.slice(start + 1);
+    const end = rest.indexOf("\n## ");
+    const section = end >= 0 ? rest.slice(0, end) : rest;
+    expect(section).toContain("[a11y: 8,160.59원, -5.54% 감소]");
+    // 티커가 3회 복제됐어도 Key Values 안에서는 한 번만 남는다.
+    expect(section.split("코스피").length - 1).toBe(1);
+  });
 });

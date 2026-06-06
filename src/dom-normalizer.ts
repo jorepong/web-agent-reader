@@ -121,6 +121,9 @@ function buildRegions(document: Document, registry: LinkRegistryBuilder, element
   const navigation = collectChildren(navBlocks, registry, elementRegistry, options, "navigation");
   if (navigation.length) regions.push(region("navigation", "Navigation", navigation));
 
+  const highlights = highlightRegion(findHighlightElements(document), registry);
+  if (highlights.length) regions.push(region("highlights", "Key Values", highlights));
+
   const mainChildren = elementToBlocks(main, registry, elementRegistry, options, "main");
   if (mainChildren.length) regions.push(region("main", "Main Content", mainChildren));
 
@@ -176,6 +179,31 @@ function findFooterElements(document: Document): Element[] {
       ),
     ).filter(isFooterLikeElement),
   );
+}
+
+// 스크린리더용으로 제공된 role="text" + aria-label 값 노드(예: 지수/환율/암호화폐 티커)는
+// 보통 헤더에 있어 region 분류에서 버려진다. 부호·방향이 담긴 권위 있는 값이므로 별도 영역으로 살린다.
+function findHighlightElements(document: Document): Element[] {
+  // 값(aria-label)은 보통 role="text" 컨테이너 자신이 아니라 그 안의 자식에 달려 있다.
+  const nodes = Array.from(document.querySelectorAll('[role="text"]')).filter(
+    (el) => compact(el.getAttribute("aria-label") ?? "").length > 0 || el.querySelector("[aria-label]") !== null,
+  );
+  return uniqueElements(nodes).slice(0, 24);
+}
+
+function highlightRegion(elements: Element[], registry: LinkRegistryBuilder): ContentBlock[] {
+  // 움직이는 티커 등은 같은 항목을 여러 번 복제하므로 텍스트 기준으로 중복을 제거한다.
+  const items: string[] = [];
+  const seen = new Set<string>();
+  for (const el of elements) {
+    const text = compact(applyA11yLabel(el, inlineText(el, registry, cssPath(el))));
+    if (!text) continue;
+    const key = normalizeForCompare(text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(text);
+  }
+  return items.length ? [{ type: "list", ordered: false, items }] : [];
 }
 
 function uniqueElements(elements: Element[]): Element[] {
@@ -239,8 +267,27 @@ function elementToBlocks(element: Element, registry: LinkRegistryBuilder, elemen
     if (cardGroup) return renderCardGroup(element, cardGroup, registry, elementRegistry, options, role);
   }
 
-  const blocks = Array.from(element.children).flatMap((child) => elementToBlocks(child, registry, elementRegistry, options, role));
-  if (blocks.length) return blocks;
+  // childNodes를 문서 순서로 훑어, 블록 자식은 재귀하고 그 사이의 맨 텍스트 노드는 문단으로 보존한다.
+  // 자식 *요소*만 재귀하면, <p> 없이 텍스트+<br>로 쓴 본문이나 깨진 마크업으로 컨테이너 직속에
+  // 떨어진 본문(일부 언론 CMS)이 통째로 누락된다.
+  const out: ContentBlock[] = [];
+  let inlineBuffer = "";
+  const flushInline = () => {
+    const text = compact(inlineBuffer);
+    inlineBuffer = "";
+    if (text.length > 30 && !isLayoutOnly(role, tag)) out.push({ type: "paragraph", text });
+  };
+  for (const node of Array.from(element.childNodes)) {
+    if (node.nodeType === 3) {
+      inlineBuffer += ` ${node.textContent ?? ""}`;
+      continue;
+    }
+    if (node.nodeType !== 1) continue;
+    flushInline();
+    out.push(...elementToBlocks(node as Element, registry, elementRegistry, options, role));
+  }
+  flushInline();
+  if (out.length) return out;
   const text = inlineText(element, registry, cssPath(element));
   return text.length > 30 && !isLayoutOnly(role, tag) ? [{ type: "paragraph", text }] : [];
 }
@@ -318,7 +365,7 @@ function cardLabel(blocks: ContentBlock[], element: Element): string {
 }
 
 function stripInlineMarkers(text: string): string {
-  return compact(text.replace(/\[L\d+\]/g, "").replace(/\[(image|button|input)[^\]]*\]/gi, ""));
+  return compact(text.replace(/\[L\d+\]/g, "").replace(/\[(image|button|input|a11y)[^\]]*\]/gi, ""));
 }
 
 // 카드의 첫 제목(없으면 첫 문단)에 activate 마커를 붙인다. 둘 다 없으면 마커 단독 문단을 앞에 둔다.
@@ -492,10 +539,26 @@ function inlineText(element: Element, registry: LinkRegistryBuilder, sourcePath:
       const text = controlText(child);
       if (text) parts.push(`[${tag}: ${text}]`);
     } else {
-      parts.push(inlineText(child, registry, sourcePath, insideLink));
+      parts.push(applyA11yLabel(child, inlineText(child, registry, sourcePath, insideLink)));
     }
   }
   return compact(parts.join(" "));
+}
+
+// 스크린리더용 접근성 텍스트(aria-label)가 보이는 텍스트와 다르면 [a11y: ...] 표식으로 보존한다.
+// 색·아이콘처럼 시각으로만 표현된 의미(예: 등락 부호·방향)는 textContent에서 사라지는데,
+// 잘 만들어진 사이트는 같은 의미를 aria-label로 노출한다. 본문과 동일하면 중복이라 표식하지 않는다.
+function applyA11yLabel(element: Element, visibleText: string): string {
+  const aria = compact(element.getAttribute("aria-label") ?? "");
+  if (!aria) return visibleText;
+  const visible = compact(visibleText);
+  if (!visible) return `[a11y: ${aria}]`;
+  if (normalizeForCompare(aria) === normalizeForCompare(visible)) return visible;
+  return `${visible} [a11y: ${aria}]`;
+}
+
+function normalizeForCompare(value: string): string {
+  return value.replace(/\s+/g, "").toLowerCase();
 }
 
 function linkText(element: Element, registry: LinkRegistryBuilder): string {

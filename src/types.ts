@@ -1,4 +1,4 @@
-export type RegionRole = "navigation" | "main" | "aside" | "footer" | "footnotes";
+export type RegionRole = "navigation" | "highlights" | "main" | "aside" | "footer" | "footnotes";
 
 export interface ConvertOptions {
   pageId?: string;
