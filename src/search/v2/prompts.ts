@@ -538,8 +538,10 @@ export function buildChildInitialMessages(
   maxParallel: number,
   candidateStatus: string,
   sectionOutline?: string,
-  currentDateTime?: string
+  currentDateTime?: string,
+  httpStatus?: number
 ): LLMMessage[] {
+  const httpStatusLine = typeof httpStatus === "number" ? `\nHTTP 상태: ${httpStatus}` : "";
   const statusBlock = candidateStatus
     ? `\n\n표시된 [C*] 링크의 후보 상태:\n${candidateStatus}\n"이미 방문함"으로 표시된 후보는 위임하지 마세요. 방문하지 않은 후보를 고르거나, 허용된다면 나중에 검색하거나, done을 선택하세요.`
     : "";
@@ -552,7 +554,7 @@ export function buildChildInitialMessages(
       role: "user",
       content: `목표: ${goal}
 원래 사용자 질문: ${parentGoal}
-시작 URL: ${startUrl}
+시작 URL: ${startUrl}${httpStatusLine}
 ${runtimeContextBlock(currentDateTime)}
 
 당신은 하위 리서처입니다. 시작 URL은 이미 방문되었고, 그 내용은 아래에 제공됩니다.
@@ -562,6 +564,7 @@ ${runtimeContextBlock(currentDateTime)}
 - 이 페이지가 목표에 답할 충분한 정보를 직접 포함한다면 즉시 done을 선택하고 답변을 작성하세요.
 - 이 페이지가 직접 답을 포함하지 않지만 관련 링크 페이지를 포함한다면(본문의 [C*] 후보 ID를 보세요), 위임 전에 먼저 이 페이지에서 어떤 후보가 목표에 맞는지 직접 가려내세요. 그런 다음 그 후보들을 targetId로 delegate 또는 delegate_parallel 하세요. 이 시작 페이지 자체를 startUrl로 다시 위임하지 마세요 — 자식이 같은 페이지를 다시 받아 한 단계가 헛돕니다. 자식 하나당 후보 페이지 하나를 맡기세요.
 - 이 페이지가 목표에 직접 답하지 못하고, 보이는 링크들도 같은 성격의 빈 페이지/일반 탐색 페이지/현재 정보 페이지만 반복한다면 내부 탐색을 오래 끌지 마세요. COVERAGE를 none 또는 partial로 두고, 왜 이 시작 URL이 부족한지와 부모가 시도할 더 적합한 출처 유형을 GAPS 또는 NEXT_CANDIDATES에 적어 done하세요.
+- 위에 HTTP 상태가 표시될 수 있습니다. 200대가 아니면(예: 403/404/5xx) 이 페이지는 차단·오류·빈 페이지일 가능성이 큽니다. 본문이 실제로 비어 있는지 확인하고, 그렇다면 같은 자리에서 더 파거나 비슷한 페이지로 계속 위임하지 말고 COVERAGE를 none/partial로 두어 부모가 다른 출처를 시도하도록 NEXT_CANDIDATES에 적어 done하세요.
 - 첫 행동으로 search를 선택하지 마세요. 부모 리서처는 이 페이지와 여기서 연결되는 페이지가 적절한 시작점이라고 판단해 당신을 이곳에 보냈습니다. 이 페이지와 링크들이 답으로 이어질 수 없다고 확인한 뒤에만 search를 고려하세요.
 
 페이지 내용:

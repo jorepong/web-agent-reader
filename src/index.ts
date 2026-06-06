@@ -10,12 +10,12 @@ export type * from "./types.js";
 export async function convertPage(url: string, options: ConvertOptions = {}): Promise<ConvertResult> {
   const { browser, page } = await launchPage(options);
   try {
-    await page.goto(url, {
+    const response = await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: options.timeoutMs ?? 30_000,
     });
     await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
-    return await finalizePage(page, options);
+    return await finalizePage(page, options, response?.status());
   } finally {
     await browser.close();
   }
@@ -85,11 +85,11 @@ async function launchPage(options: ConvertOptions): Promise<{ browser: Browser; 
   return { browser, page };
 }
 
-async function finalizePage(page: Page, options: ConvertOptions): Promise<ConvertResult> {
+async function finalizePage(page: Page, options: ConvertOptions, httpStatus?: number): Promise<ConvertResult> {
   const render = await stabilizeByScrolling(page, options);
   await removeNonRenderedElements(page);
   const html = await page.content();
-  return convertHtml(html, page.url(), { ...options, render });
+  return { ...convertHtml(html, page.url(), { ...options, render }), httpStatus };
 }
 
 // 보이는 텍스트로 activate 대상을 찾는다. id가 렌더마다 바뀌어도 내용 기반이라 안정적이다.

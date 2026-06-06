@@ -151,4 +151,6 @@ export interface ConvertResult {
   markdown: string;
   links: LinkRegistry;
   elements: ElementRegistry;
+  /** 최초 내비게이션의 HTTP 상태 코드. 알 수 없으면 생략(예: 클릭 해소 경로). */
+  httpStatus?: number;
 }

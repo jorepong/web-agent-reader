@@ -541,7 +541,8 @@ export async function runResearcher(
         budget.limits.maxParallel,
         candidateStatus,
         prepared.outline,
-        brief.runtimeContext?.currentDateTime
+        brief.runtimeContext?.currentDateTime,
+        result.httpStatus
       );
       // 자식의 시작 페이지를 currentSurface로 둔다 → 페이지의 [C*] 후보를 delegate할 때 동일 메커니즘 사용.
       // 검색 결과가 아니라 일반 페이지지만, links 레지스트리는 같은 형태라 그대로 활용 가능.
