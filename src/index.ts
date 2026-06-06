@@ -62,11 +62,15 @@ export async function activateLink(pageUrl: string, locator: ActivateLocator, op
 async function launchPage(options: ConvertOptions): Promise<{ browser: Browser; page: Page }> {
   const stealth = options.stealth ?? false;
   const browser = await chromium.launch({
-    headless: true,
-    ...(stealth && {
-      channel: "chrome",
-      args: ["--disable-blink-features=AutomationControlled"],
-    }),
+    // headless:false + --headless=new 로 구형 headless-shell 대신 신형 헤드리스를 강제한다.
+    // (headless:true면 Playwright가 자체 --headless를 주입해 신형 지정이 무력화될 수 있다.)
+    // 신형 헤드리스는 일반 브라우저와 동작이 더 가까워 봇 탐지 난도가 높다.
+    headless: false,
+    args: [
+      "--headless=new",
+      ...(stealth ? ["--disable-blink-features=AutomationControlled"] : []),
+    ],
+    ...(stealth && { channel: "chrome" }),
   });
   const context = await browser.newContext({
     userAgent:
