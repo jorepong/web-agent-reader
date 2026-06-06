@@ -16,6 +16,9 @@ logs/
 *.log
 *.json.log
 
+# 경험 기록 문서 (로컬 전용)
+docs/troubleshooting/
+
 # macOS
 .DS_Store
 
