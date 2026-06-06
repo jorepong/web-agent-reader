@@ -29,7 +29,7 @@
       "maxExplores": 20,
       "maxParallel": 3,
       "maxDepth": 5,
-      "maxChildCallsPerAgent": 3
+      "maxChildCallsPerAgent": 30
     }
   }
 }
